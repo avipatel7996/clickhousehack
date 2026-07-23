@@ -22,6 +22,7 @@ create table if not exists public.dataset_imports (
   physical_tables jsonb not null default '[]'::jsonb,
   row_count bigint,
   license text,
+  trigger_run_id text,
   idempotency_key text not null,
   created_at timestamptz not null default now(),
   unique (workspace_id, idempotency_key)
@@ -39,6 +40,7 @@ create table if not exists public.analysis_runs (
   created_at timestamptz not null default now()
 );
 alter table public.analysis_runs add column if not exists error_message text;
+alter table public.dataset_imports add column if not exists trigger_run_id text;
 
 -- The Trigger worker uses the Supabase service role and must be able to read
 -- and update these tables even though browser access remains RLS-protected.
