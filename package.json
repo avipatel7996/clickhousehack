@@ -10,13 +10,16 @@
     "trigger:dev": "trigger dev",
     "trigger:deploy": "trigger deploy"
   },
-  "workspaces": ["apps/*", "packages/*"],
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "dependencies": {
     "@aws-sdk/client-s3": "^3.850.0",
     "@clickhouse/client": "^1.12.1",
     "@supabase/ssr": "^0.7.0",
     "@supabase/supabase-js": "^2.50.0",
-    "@trigger.dev/sdk": "^4.0.0",
+    "@trigger.dev/sdk": "^4.5.7",
     "next": "^15.4.0",
     "openai": "^5.8.2",
     "react": "^19.1.0",
@@ -28,9 +31,9 @@
     "@types/node": "^22.15.0",
     "@types/react": "^19.1.0",
     "@types/react-dom": "^19.1.0",
-    "typescript": "^5.8.0",
-    "vitest": "^3.2.0",
     "trigger.dev": "4.5.7",
-    "tsx": "^4.19.0"
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0",
+    "vitest": "^3.2.0"
   }
 }
