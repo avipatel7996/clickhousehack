@@ -35,6 +35,18 @@ function InsightView({ insight }: { insight: Insight }) {
   </article>;
 }
 
+function WorkTrace({ parts }: { parts: any[] }) {
+  const steps = parts.filter((part) => part.type === "tool-inspect_dataset" || part.type === "tool-search_records" || part.type === "tool-query_clickhouse");
+  if (!steps.length) return null;
+  return <details style={{ marginTop: 10, border: "1px solid #e2e8f0", borderRadius: 8, padding: "8px 12px", background: "white" }}>
+    <summary style={{ cursor: "pointer", fontWeight: 600 }}>Show work · {steps.length} ClickHouse step{steps.length === 1 ? "" : "s"}</summary>
+    {steps.map((step, index) => {
+      const output = step.output ?? step.result;
+      return <div key={index} style={{ marginTop: 12, paddingTop: 12, borderTop: index ? "1px solid #e2e8f0" : undefined }}><strong>{index + 1}. {step.type.replace("tool-", "").replaceAll("_", " ")}</strong>{step.input && <pre style={{ whiteSpace: "pre-wrap", fontSize: 12, color: "#475569" }}>{JSON.stringify(step.input, null, 2)}</pre>}{output?.sql && <pre style={{ whiteSpace: "pre-wrap", overflowX: "auto", fontSize: 12, background: "#0f172a", color: "#e2e8f0", padding: 10, borderRadius: 6 }}>{output.sql}</pre>}{typeof output?.rowCount === "number" && <small>Returned {output.rowCount} row{output.rowCount === 1 ? "" : "s"}</small>}{output?.rows?.length ? <pre style={{ whiteSpace: "pre-wrap", overflowX: "auto", fontSize: 11 }}>{JSON.stringify(output.rows.slice(0, 5), null, 2)}</pre> : null}</div>;
+    })}
+  </details>;
+}
+
 export function DatasetAgentChat({ datasetId, datasetName }: { datasetId: string; datasetName: string }) {
   const [chatId] = useState(() => crypto.randomUUID());
   const [input, setInput] = useState("");
@@ -61,7 +73,7 @@ export function DatasetAgentChat({ datasetId, datasetName }: { datasetId: string
       if (insight) return <InsightView key={index} insight={insight} />;
       if (part.type?.startsWith("tool-") && part.state !== "output-available") return <p key={index} style={{ color: "#64748b" }}>Working: {part.type.replace("tool-", "").replaceAll("_", " ")}…</p>;
       return null;
-    })}</div>)}</div>
+    })}{message.role === "assistant" && <WorkTrace parts={message.parts ?? []} />}</div>)}</div>
     <form onSubmit={submit} style={{ display: "flex", gap: 12, marginTop: 16 }}><input value={input} onChange={(event) => setInput(event.target.value)} placeholder="e.g. Which Nolan movie features Leonardo DiCaprio?" style={{ flex: 1, padding: 12 }} /><button disabled={status === "streaming"}>{status === "streaming" ? "Thinking…" : "Ask"}</button>{status === "streaming" && <button type="button" onClick={stop}>Stop</button>}</form>
   </section>;
 }
