@@ -24,6 +24,7 @@ export const analyzeDataset = task({
     const supabase = process.env.SUPABASE_SERVICE_ROLE_KEY && process.env.NEXT_PUBLIC_SUPABASE_URL
       ? createClient(process.env.NEXT_PUBLIC_SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY)
       : null;
+    if (supabase) await supabase.from("analysis_runs").update({ status: "running" }).eq("id", input.analysisId);
     let physicalTables: string[] = [];
     let version = "unknown";
     if (supabase) {

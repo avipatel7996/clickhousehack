@@ -15,7 +15,20 @@ export default function HomePage() {
     setImportStatus("Validating Kaggle dataset…");
     const response = await fetch("/api/imports", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ url }) });
     const body = await response.json();
-    setImportStatus(body.message ?? body.error ?? "Import request accepted.");
+    if (!response.ok) { setImportStatus(body.error ?? "Import failed."); return; }
+    setImportStatus(`Import queued (run ${body.triggerRunId ?? "pending"}).`);
+    if (body.importId) {
+      for (let attempt = 0; attempt < 60; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        const poll = await fetch(`/api/imports?id=${encodeURIComponent(body.importId)}`);
+        if (!poll.ok) continue;
+        const result = await poll.json();
+        setImportStatus(`Import ${result.status}…`);
+        if (result.status === "published") { setImportStatus(`Imported ${result.row_count ?? 0} rows into ClickHouse.`); return; }
+        if (result.status === "failed") { setImportStatus(result.error_message ?? "Import failed. Check Trigger Runs."); return; }
+      }
+      setImportStatus("Import is still running. Open Trigger Runs for live logs.");
+    }
   }
 
   async function askQuestion(event: FormEvent) {
@@ -31,7 +44,7 @@ export default function HomePage() {
       return;
     }
     setMessages((items) => [...items, { role: "assistant", text: "Analysis queued; waiting for the ClickHouse-backed result…" }]);
-    for (let attempt = 0; attempt < 30; attempt++) {
+    for (let attempt = 0; attempt < 90; attempt++) {
       await new Promise((resolve) => setTimeout(resolve, 2000));
       const poll = await fetch(`/api/analyses?id=${encodeURIComponent(body.analysisId)}`);
       if (!poll.ok) continue;

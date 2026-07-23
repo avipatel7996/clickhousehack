@@ -24,6 +24,7 @@ export const ingestDataset = task({
     const supabase = process.env.SUPABASE_SERVICE_ROLE_KEY && process.env.NEXT_PUBLIC_SUPABASE_URL
       ? createClient(process.env.NEXT_PUBLIC_SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY)
       : null;
+    if (supabase) await supabase.from("dataset_imports").update({ status: "inspecting" }).eq("id", input.importId).eq("workspace_id", input.workspaceId);
     if (!process.env.R2_ENDPOINT || !process.env.R2_BUCKET || !process.env.R2_ACCESS_KEY_ID || !process.env.R2_SECRET_ACCESS_KEY) throw new Error("R2_ENDPOINT, R2_BUCKET, R2_ACCESS_KEY_ID, and R2_SECRET_ACCESS_KEY are required");
     const repository = {
       async findByIdempotencyKey(key: string) {
