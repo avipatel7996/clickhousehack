@@ -16,6 +16,15 @@ describe('runtime ingestion adapters', () => {
     expect(listed.files[0].path).toBe('data.csv');
   });
 
+  it('invokes Kaggle as a module when the configured Python executable is absolute', async () => {
+    const exec = vi.fn(async (_bin: string, args: readonly string[]) => ({
+      stdout: JSON.stringify([{ name: 'data.csv', size: 3 }]), stderr: ''
+    }));
+    const gateway = new KaggleCliGateway({ executable: '/opt/venv/bin/python', execFile: exec });
+    await gateway.list({ owner: 'acme', slug: 'demo', canonicalRef: 'acme/demo' });
+    expect(exec).toHaveBeenCalledWith('/opt/venv/bin/python', ['-m', 'kaggle', 'datasets', 'files', '-d', 'acme/demo', '--format', 'json']);
+  });
+
   it('PUTs objects and publishes JSONEachRow with injected fetches', async () => {
     const fetch = vi.fn<typeof globalThis.fetch>(async (_url, _init) => new Response('', { status: 200, headers: { etag: 'abc' } }));
     const object = await new R2ObjectStore({ endpoint: 'https://r2.test', fetch }).put('imports/a.csv', new Uint8Array([1]));

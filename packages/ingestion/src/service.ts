@@ -12,6 +12,7 @@ export interface ClickHouseLoader {
 }
 export interface ImportRepository {
   findByIdempotencyKey(key: string): Promise<{ importId: string; status: string } | null>;
+  markFailed?(input: { importId: string; message: string }): Promise<void>;
   markPublished(input: { importId: string; source: KaggleDatasetRef; version: number; files: ManifestFile[]; tableIds: string[]; rowCount: number }): Promise<void>;
 }
 export interface ImportRequest { workspaceId: string; importId: string; kaggleUrl: string; selectedFiles?: string[] }

@@ -2,7 +2,7 @@
 import { execFile as nodeExecFile } from 'node:child_process';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { promisify } from 'node:util';
 import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import type { ClickHouseConfig } from '../../core/src/types';
@@ -68,7 +68,11 @@ export class KaggleCliGateway implements KaggleGateway {
     // Trigger's Python build extension installs console scripts in a Python
     // environment that is not always on Node's PATH. Running the module keeps
     // the production worker independent of that console-script location.
-    if (this.executable === 'python' || this.executable === 'python3') return { file: this.executable, args: ['-m', 'kaggle', ...args] };
+    // Trigger's Python extension exposes an absolute interpreter path (for
+    // example /opt/venv/bin/python). Passing the Kaggle subcommand directly
+    // to that binary makes Python look for /app/datasets as a script.
+    // Detect the interpreter by basename so both PATH and absolute paths work.
+    if (/^python(?:\d+(?:\.\d+)?)?$/.test(basename(this.executable))) return { file: this.executable, args: ['-m', 'kaggle', ...args] };
     return { file: this.executable, args: [...args] };
   }
   async list(ref: KaggleDatasetRef) {

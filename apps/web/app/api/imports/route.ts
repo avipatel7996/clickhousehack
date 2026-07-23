@@ -15,7 +15,7 @@ export async function GET(request: Request) {
     if (error) return NextResponse.json({ error: error.message }, { status: 500 });
     return NextResponse.json({ imports: data ?? [] });
   }
-  const { data, error } = await supabase.from("dataset_imports").select("id,status,row_count,physical_tables,created_at").eq("id", id).eq("workspace_id", workspaceId ?? "").single();
+  const { data, error } = await supabase.from("dataset_imports").select("id,status,row_count,physical_tables,error_message,created_at").eq("id", id).eq("workspace_id", workspaceId ?? "").single();
   if (error) return NextResponse.json({ error: error.message }, { status: 404 });
   return NextResponse.json(data);
 }
@@ -54,10 +54,10 @@ export async function POST(request: Request) {
     const dispatch = await dispatchTask("ingest-dataset", { importId, workspaceId, kaggleRef: `${reference.owner}/${reference.slug}${reference.version ? `/versions/${reference.version}` : ""}`, selectedFiles: body.selectedFiles ?? [] });
     if (!dispatch.enabled || dispatch.error || !dispatch.runId) {
       const message = dispatch.error ?? "TRIGGER_SECRET_KEY is missing; no ingestion worker was dispatched";
-      await supabase?.from("dataset_imports").update({ status: "failed" }).eq("id", importId);
+      await supabase?.from("dataset_imports").update({ status: "failed", error_message: message }).eq("id", importId).eq("workspace_id", workspaceId);
       return NextResponse.json({ error: message, importId, live: false }, { status: 503 });
     }
-    // trigger_run_id is optional for compatibility with databases created before tracking columns were added.
+    if (supabase && dispatch.runId) await supabase.from("dataset_imports").update({ trigger_run_id: dispatch.runId }).eq("id", importId).eq("workspace_id", workspaceId);
     return NextResponse.json({ status: "queued", importId, workspaceId, triggerRunId: dispatch.runId, live: dispatch.enabled && !dispatch.error, warning: dispatch.error ?? (dispatch.enabled ? undefined : "Trigger.dev is not configured; running in demo mode.") }, { status: 202 });
   } catch (error) {
     console.error("Dataset import setup failed", error);

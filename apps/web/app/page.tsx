@@ -36,7 +36,7 @@ export default function HomePage() {
         const result = await poll.json();
         setImportStatus(`Import ${result.status}…`);
         if (result.status === "published") { setImportStatus(`Imported ${result.row_count ?? 0} rows into ClickHouse (finished).`); await refreshDatasets(); return; }
-        if (result.status === "failed") { setImportStatus("Import failed. Check Trigger Runs."); return; }
+        if (result.status === "failed") { setImportStatus(`Import failed: ${result.error_message ?? "unknown error"}`); return; }
       }
       setImportStatus("Import is still running. Open Trigger Runs for live logs.");
     }
