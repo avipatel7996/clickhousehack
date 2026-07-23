@@ -148,7 +148,7 @@ type AnalystInsight = {
 const analysisPlanSchema = z.object({
   objective: z.string().trim().min(3).max(240),
   subquestions: z.array(z.string().trim().min(3).max(220)).min(1).max(3),
-  entityTerms: z.array(z.string().trim().min(2).max(100)).max(3),
+  entityTerms: z.array(z.string().trim().min(2).max(100)).max(6),
   requirements: z.array(z.object({
     purpose: z.string().trim().min(3).max(160),
     matchingColumns: z.array(z.string().trim().min(1).max(120)).max(8),
@@ -206,13 +206,13 @@ async function createAnalysisPlan(model: LanguageModel, question: string, contex
       schemaName: "analysis_plan",
       schemaDescription: "A minimal, executable plan for a database question.",
       temperature: 0,
-      prompt: `Create the minimum executable evidence plan for this user question: ${JSON.stringify(question)}\n\nAvailable imported tables and columns: ${JSON.stringify(schemaSummary)}\n\nRules:\n- Use one sub-question for a simple aggregate or lookup; add steps only for distinct entities, filters, or dependent evidence. Never add generic filler.\n- entityTerms is ONLY for literal values that must be found in data, such as a person's name, a named team, a title, or a product. It must be empty for output categories or aggregate instructions such as “top 10 players”, “best products”, “match data”, or “average score”. Put separate literal names in separate entries.\n- For every required relationship/filter that needs a specific field, add a requirement with the exact matchingColumns from the schema. If the schema has no field that can verify it, use an empty matchingColumns array.\n- Never use world knowledge or invent a schema column.`,
+      prompt: `Create the minimum executable evidence plan for this user question: ${JSON.stringify(question)}\n\nAvailable imported tables and columns: ${JSON.stringify(schemaSummary)}\n\nRules:\n- Use one sub-question for a simple aggregate or lookup; add steps only for distinct entities, filters, or dependent evidence. Never add generic filler.\n- entityTerms is ONLY for literal values that must be found in data, such as a person's name, a named team, a title, or a product. It must be empty for output categories or aggregate instructions such as “top 10 players”, “best products”, “match data”, or “average score”. Put every distinct literal entity in a separate entry: for “Nolan and DeCaprio”, emit “Nolan” and “DeCaprio”, never one combined search. These are independent sub-questions whose evidence will be intersected by the final query.\n- For every required relationship/filter that needs a specific field, add a requirement with the exact matchingColumns from the schema. If the schema has no field that can verify it, use an empty matchingColumns array.\n- Never use world knowledge or invent a schema column.`,
     });
     const plan = result.object;
     return {
       objective: plan.objective,
       subquestions: [...new Set(plan.subquestions)].slice(0, 3),
-      entityTerms: [...new Set(plan.entityTerms.filter(isLiteralEntitySearchTerm))].slice(0, 3),
+      entityTerms: atomicEntityTerms(plan.entityTerms.filter(isLiteralEntitySearchTerm)),
       requirements: plan.requirements.map((requirement) => ({
         purpose: requirement.purpose,
         matchingColumns: requirement.matchingColumns.filter((column) => availableColumns.has(column)),
@@ -225,6 +225,14 @@ async function createAnalysisPlan(model: LanguageModel, question: string, contex
 
 function normalizeTerm(term: string) {
   return term.length > 3 && term.endsWith("s") ? term.slice(0, -1) : term;
+}
+
+/** A phrase containing multiple named obligations must be checked separately. */
+function atomicEntityTerms(terms: string[]) {
+  return [...new Set(terms.flatMap((term) => term
+    .split(/\s*(?:,|\band\b|\&|\bwith\b)\s*/i)
+    .map((value) => value.trim())
+    .filter((value) => value.length >= 2)))].slice(0, 6);
 }
 
 function questionTerms(question: string) {
@@ -449,7 +457,7 @@ async function searchImportedTextFields(context: DatasetContext, clickhouse: Cli
 }
 
 async function executeAnalysisPlan(context: DatasetContext, plan: AnalysisPlan) {
-  const terms = plan.entityTerms.slice(0, 3);
+  const terms = atomicEntityTerms(plan.entityTerms);
   if (!terms.length) return [] as SearchResult[];
   const clickhouse = new ClickHouseClient(createClickHouseConfig());
   const workflow = createWorkflowReporter();
@@ -473,7 +481,9 @@ async function executeAnalysisPlan(context: DatasetContext, plan: AnalysisPlan) 
 
 function blockerInsight(question: string, plan: AnalysisPlan, results: SearchResult[]): AnalystInsight | null {
   const missing = results.filter((result) => !result.rowCount);
-  if (!missing.length) return null;
+  // Preflight misses are evidence for the final relationship query. Do not
+  // stop before the model applies all constraints and checks the intersection.
+  if (!missing.length || missing.length < results.length || !results.length) return null;
   const rows = [
     ...missing.map((result) => ({ Check: `Find “${result.query}”`, Outcome: "No matching values in imported text fields" })),
   ];
@@ -616,17 +626,6 @@ export const datasetChat = chat
       if (!clientData) throw new Error("Dataset context is required");
       const context = datasetContext.get();
       const question = latestUserQuestion(messages);
-      const directInsight = question ? await prepareUnfilteredRanking(context, question) : null;
-      // A bare aggregate is already fully answered by a verified ClickHouse
-      // query. Finishing here avoids an unnecessary model request entirely.
-      if (directInsight) {
-        chat.response.write({
-          type: "data-analyst-insight",
-          id: "analyst-insight",
-          data: directInsight,
-        } as never);
-        return;
-      }
       const model = resolveChatModel(clientData);
       const planner = question ? createWorkflowReporter() : undefined;
       const plan = question && planner ? await planner.activity(
@@ -662,7 +661,7 @@ export const datasetChat = chat
         // Gemini is selected per session; Featherless retains its fast
         // non-reasoning default for sessions that do not opt into Gemini.
         model,
-        system: `You are a precise, fast data analyst for arbitrary imported datasets. Answer only from ClickHouse results. Dataset tables and schemas: ${JSON.stringify(context.tables)}. The orchestrator has already created and executed this evidence plan: ${preflight}. Use those completed checks; do not repeat them. Identify the relevant table and requested constraints; resolve only literal named values with search_records. Never search output categories or aggregate instructions such as “top 10 players”; directly aggregate using schema columns instead. Run a bounded read-only query that applies every supported constraint; compare the result with the original question before answering, and explicitly state unsupported constraints or zero evidence. search_records searches every imported text field using substring matching. If it finds nothing, say what was searched and never infer an identity from outside knowledge. If it finds multiple candidates, state the candidates and the data-backed reason for any selection before continuing. Never repeat an identical tool call. Use rank_entities only for multi-metric rankings and select its table explicitly when necessary. Do not inspect the dataset unless a sample is necessary. End every workflow with present_insight: it is the final answer contract and must include either verified results or a precise data limitation. Keep any supporting text under 120 words. Do not describe hidden reasoning. Never invent facts.`,
+        system: `You are a precise, fast data analyst for arbitrary imported datasets. Answer only from ClickHouse results. Dataset tables and schemas: ${JSON.stringify(context.tables)}. The orchestrator created this minimum evidence plan: ${preflight}. Treat each listed sub-question as an actual dependency: use its evidence to choose fields and constraints, then run one final bounded query that answers the original question. Do not skip the final relationship/intersection check. Use completed preflight checks; do not repeat identical searches. Resolve only literal named values with search_records. Never search output categories or aggregate instructions such as “top 10 players”; directly aggregate using schema columns instead. Run a bounded read-only query that applies every supported constraint; compare the result with the original question before answering, and explicitly state unsupported constraints or zero evidence. search_records searches every imported text field using substring matching. If it finds nothing, say what was searched and never infer an identity from outside knowledge. If it finds multiple candidates, state the candidates and the data-backed reason for any selection before continuing. Never repeat an identical tool call. Use rank_entities only for multi-metric rankings and select its table explicitly when necessary. Do not inspect the dataset unless a sample is necessary. End every workflow with present_insight: it is the final answer contract and must include either verified results or a precise data limitation. Keep any supporting text under 120 words. Do not describe hidden reasoning. Never invent facts.`,
         messages,
         abortSignal: signal,
         maxOutputTokens: 240,

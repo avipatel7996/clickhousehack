@@ -97,6 +97,8 @@ function InsightView({ insight }: { insight: Insight }) {
     <p>{insight.summary}</p>
     {insight.cards?.length ? <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: 10 }}>{insight.cards.map((card, index) => <div key={index} style={{ background: "white", borderRadius: 8, padding: 12, border: "1px solid #e2e8f0" }}><small>{card.label}</small><strong style={{ display: "block", fontSize: 20 }}>{card.value}</strong>{card.detail && <small>{card.detail}</small>}</div>)}</div> : null}
     {hasTable ? <div style={{ overflowX: "auto", marginTop: 12 }}><table style={{ borderCollapse: "collapse", width: "100%" }}><thead><tr>{insight.table!.columns.map((column) => <th key={column} style={{ textAlign: "left", borderBottom: "1px solid #cbd5e1", padding: 8 }}>{column}</th>)}</tr></thead><tbody>{insight.table!.rows.map((row, rowIndex) => <tr key={rowIndex}>{insight.table!.columns.map((column) => <td key={column} style={{ borderBottom: "1px solid #e2e8f0", padding: 8 }}>{String(row[column] ?? "—")}</td>)}</tr>)}</tbody></table></div> : null}
+    {/* A table is already the primary result view; rendering the same rows as
+        a chart creates a duplicate answer and makes long responses noisy. */}
     {!hasTable && chart?.type && chart.type !== "none" && chart.data.length && chart.x && chart.y ? <div style={{ display: "grid", gap: 8, marginTop: 14 }}>{chart.data.map((row, index) => { const value = Number(row[chart.y!] ?? 0); return <div key={index} style={{ display: "grid", gridTemplateColumns: "minmax(90px, 1fr) 3fr auto", gap: 8, alignItems: "center" }}><small style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{String(row[chart.x!] ?? "—")}</small><div style={{ height: 10, borderRadius: 99, background: "#e2e8f0", overflow: "hidden" }}><div style={{ width: `${Math.max(0, Math.min(100, (value / max) * 100))}%`, height: "100%", background: "linear-gradient(90deg,#2563eb,#7c3aed)" }} /></div><small>{String(row[chart.y!] ?? "—")}</small></div>; })}</div> : null}
     {insight.caveat && <small style={{ color: "#64748b" }}>{insight.caveat}</small>}
   </article>;
@@ -166,10 +168,12 @@ function DatasetChatSession({ datasetId, provider }: { datasetId: string; provid
     <div>{activity && !latestAssistantId && <WorkflowTrace parts={[]} activity={activity} />}{messages.map((message: any) => {
       const isLiveAssistant = Boolean(activity) && message.role === "assistant" && message.id === latestAssistantId;
       const hasInsight = message.role === "assistant" && message.parts?.some((part: any) => Boolean(insightFromPart(part)));
+      const insightIndexes = (message.parts ?? []).map((part: any, index: number) => insightFromPart(part) ? index : -1).filter((index: number) => index >= 0);
+      const lastInsightIndex = insightIndexes.at(-1);
       return <div key={message.id} style={{ margin: "16px 0" }}><strong>{message.role === "user" ? "You" : "Analyst"}</strong>{message.role === "assistant" && <WorkflowTrace parts={message.parts ?? []} activity={isLiveAssistant ? activity : null} />}{message.parts?.map((part: any, index: number) => {
         if (part.type === "text") return hasInsight ? null : <p key={index}>{part.text}{isLiveAssistant && <span aria-hidden="true" style={{ color: "#0284c7" }}> ▍</span>}</p>;
         const insight = insightFromPart(part);
-        if (insight) return <InsightView key={index} insight={insight} />;
+        if (insight) return index === lastInsightIndex ? <InsightView key={index} insight={insight} /> : null;
         const evidence = entityEvidenceFromPart(part);
         if (evidence) return <EntityEvidenceView key={index} evidence={evidence} />;
         const plan = analysisPlanFromPart(part);
