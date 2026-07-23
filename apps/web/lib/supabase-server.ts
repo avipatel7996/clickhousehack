@@ -2,11 +2,11 @@ import { createServerClient } from "@supabase/ssr";
 import type { SupabaseClient, User } from "@supabase/supabase-js";
 import { cookies } from "next/headers";
 
-/** Returns a cookie-aware Supabase client, or null for the local/demo setup. */
+/** Returns a cookie-aware Supabase client. Demo auth must be explicitly opted into. */
 export async function getSupabaseServerClient(): Promise<SupabaseClient | null> {
-  // Local development can exercise the full UI without requiring a browser session.
-  // Production always uses Supabase auth when configured.
-  if (process.env.NODE_ENV !== "production" && process.env.LOCAL_DEMO_AUTH !== "false") return null;
+  // Never silently dispatch real Trigger jobs with synthetic workspace IDs.
+  // Demo mode is available only when explicitly requested.
+  if (process.env.LOCAL_DEMO_AUTH === "true") return null;
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? process.env.SUPABASE_ANON_KEY;
   if (!url || !key) return null;
