@@ -113,7 +113,11 @@ export class KaggleCliGateway implements KaggleGateway {
     const requestedName = basename(requestedPath);
     const exact = entries.find((entry) => basename(entry) === requestedName);
     const normalized = entries.filter((entry) => kaggleFilenameKey(basename(entry)) === kaggleFilenameKey(requestedName));
-    const resolved = exact ?? (normalized.length === 1 ? normalized[0] : undefined);
+    // `-f` downloads into a unique empty directory. If the CLI returned one
+    // file but encoded its filename in an unexpected way, that one file is
+    // still the requested artifact. This is safer than guessing when there
+    // are multiple candidates.
+    const resolved = exact ?? (normalized.length === 1 ? normalized[0] : undefined) ?? (entries.length === 1 ? entries[0] : undefined);
     if (!resolved) {
       const found = entries.slice(0, 20).join(", ") || "no files";
       throw new Error(`Kaggle download did not produce ${requestedPath}. Found: ${found}`);
