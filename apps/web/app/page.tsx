@@ -1,14 +1,27 @@
 "use client";
 
-import { FormEvent, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 
 type Message = { role: "user" | "assistant"; text: string };
+type Dataset = { id: string; canonical_ref: string; status: string; row_count?: number | null };
 
 export default function HomePage() {
   const [url, setUrl] = useState("");
   const [importStatus, setImportStatus] = useState("");
   const [question, setQuestion] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
+  const [datasets, setDatasets] = useState<Dataset[]>([]);
+  const [datasetId, setDatasetId] = useState("");
+  useEffect(() => { refreshDatasets(); }, []);
+
+  async function refreshDatasets() {
+    const response = await fetch("/api/imports");
+    if (!response.ok) return;
+    const body = await response.json() as { imports?: Dataset[] };
+    const available = (body.imports ?? []).filter((item) => item.status === "published");
+    setDatasets(available);
+    if (!datasetId && available[0]) setDatasetId(available[0].id);
+  }
 
   async function importDataset(event: FormEvent) {
     event.preventDefault();
@@ -24,7 +37,7 @@ export default function HomePage() {
         if (!poll.ok) continue;
         const result = await poll.json();
         setImportStatus(`Import ${result.status}…`);
-        if (result.status === "published") { setImportStatus(`Imported ${result.row_count ?? 0} rows into ClickHouse.`); return; }
+        if (result.status === "published") { setImportStatus(`Imported ${result.row_count ?? 0} rows into ClickHouse (finished).`); await refreshDatasets(); return; }
         if (result.status === "failed") { setImportStatus("Import failed. Check Trigger Runs."); return; }
       }
       setImportStatus("Import is still running. Open Trigger Runs for live logs.");
@@ -37,7 +50,7 @@ export default function HomePage() {
     const current = question;
     setQuestion("");
     setMessages((items) => [...items, { role: "user", text: current }]);
-    const response = await fetch("/api/analyses", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ question: current }) });
+    const response = await fetch("/api/analyses", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ question: current, datasetId: datasetId || undefined }) });
     const body = await response.json();
     if (!response.ok || body.status === "failed") {
       setMessages((items) => [...items, { role: "assistant", text: body.warning ?? body.error ?? "Analysis could not be queued." }]);
@@ -51,7 +64,7 @@ export default function HomePage() {
       const result = await poll.json();
       if (result.status === "completed") {
         const answer = result.answer?.answer ?? result.answer?.result?.answer ?? "Analysis completed.";
-        setMessages((items) => [...items, { role: "assistant", text: String(answer) }]);
+        setMessages((items) => [...items, { role: "assistant", text: `${String(answer)} (finished)` }]);
         return;
       }
       if (result.status === "failed") {
@@ -73,6 +86,7 @@ export default function HomePage() {
     </section>
     <section style={{ marginTop: 24, padding: 24, border: "1px solid #e2e8f0", borderRadius: 12 }}>
       <h2>2. Ask a grounded question</h2>
+      <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 12 }}><button type="button" onClick={refreshDatasets}>Refresh datasets</button><select value={datasetId} onChange={(event) => setDatasetId(event.target.value)} style={{ flex: 1, padding: 10 }}><option value="">Select an imported dataset</option>{datasets.map((dataset) => <option key={dataset.id} value={dataset.id}>{dataset.canonical_ref} ({dataset.row_count ?? "?"} rows)</option>)}</select></div>
       <form onSubmit={askQuestion} style={{ display: "flex", gap: 12 }}><input value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="Which team has the strongest evidence?" style={{ flex: 1, padding: 12 }} /><button type="submit">Analyze</button></form>
       <div aria-live="polite">{messages.map((message, index) => <p key={index}><strong>{message.role === "user" ? "You" : "Analyst"}:</strong> {message.text}</p>)}</div>
     </section>
