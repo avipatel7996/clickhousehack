@@ -84,19 +84,6 @@ function parseAnswer(content: string | null, schema: DatasetSchema, evidence: Ru
 /** Runs a grounded Featherless tool-calling analysis using only the injected read-only executor. */
 export async function runAnalysis(question: string, options: AnalysisRuntimeOptions): Promise<StructuredAnalysisAnswer> {
   if (!question.trim()) throw new Error("question is required");
-  // Deterministic answers for high-frequency questions keep the product useful
-  // even when a hosted model is busy or returns no tool call.
-  const table = options.schema.table;
-  if (table && /\bhow many rows?\b|\brow count\b|\bnumber of rows?\b/i.test(question)) {
-    const started = Date.now();
-    const result = await options.queryExecutor.query<{ row_count: number }>(`SELECT count() AS row_count FROM ${table}`);
-    const rowCount = Number(result.rows[0]?.row_count ?? 0);
-    return { answer: `This dataset contains ${rowCount.toLocaleString()} rows.`, evidence: [{ queryId: "deterministic_row_count", sql: `SELECT count() AS row_count FROM ${table}`, datasetId: options.schema.datasetId, rowCount: result.rows.length, elapsedMs: Date.now() - started }], caveats: [], datasetVersion: String(options.schema.version) };
-  }
-  if (table && /what('?s| is) this (dataset|database) about|describe this (dataset|database)/i.test(question)) {
-    const columns = options.schema.columns.map((column) => column.name).slice(0, 20);
-    return { answer: `This dataset has ${options.schema.columns.length} columns: ${columns.join(", ")}. It is stored in ClickHouse table ${table}. Ask for a count, breakdown, ranking, or trend to generate a data-backed result.`, evidence: [], caveats: ["This description is based on the imported schema; no semantic description was supplied by Kaggle."], datasetVersion: String(options.schema.version) };
-  }
   const schemaText = JSON.stringify(options.schema);
   const messages: ChatMessage[] = [
     { role: "system", content: `You are a data analyst. Dataset schema: ${schemaText}. Answer only from query results. Return JSON with answer (string), chart (optional {type,x,y,series}), caveats (string[]), and datasetVersion.` },
@@ -106,7 +93,15 @@ export async function runAnalysis(question: string, options: AnalysisRuntimeOpti
   const maxToolCalls = Math.max(0, options.maxToolCalls ?? 4);
   let calls = 0;
   while (true) {
-    const response = await options.client.chat({ messages, model: options.model, temperature: 0, response_format: { type: "json_object" }, tools: queryTool ? [queryTool] : [], tool_choice: calls === 0 ? { type: "function", function: { name: "query_dataset" } } : "auto" }, options.signal);
+    const needsTool = calls === 0 || messages[messages.length - 1]?.role === "tool";
+    const response = await options.client.chat({
+      messages,
+      model: options.model,
+      temperature: 0,
+      ...(needsTool ? {} : { response_format: { type: "json_object" } }),
+      tools: queryTool ? [queryTool] : [],
+      tool_choice: calls === 0 ? { type: "function", function: { name: "query_dataset" } } : "auto",
+    }, options.signal);
     const message = response.choices[0]?.message;
     if (!message) throw new Error("Featherless returned no assistant message");
     const toolCalls = message.tool_calls ?? [];
