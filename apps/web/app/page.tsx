@@ -25,7 +25,7 @@ export default function HomePage() {
         const result = await poll.json();
         setImportStatus(`Import ${result.status}…`);
         if (result.status === "published") { setImportStatus(`Imported ${result.row_count ?? 0} rows into ClickHouse.`); return; }
-        if (result.status === "failed") { setImportStatus(result.error_message ?? "Import failed. Check Trigger Runs."); return; }
+        if (result.status === "failed") { setImportStatus("Import failed. Check Trigger Runs."); return; }
       }
       setImportStatus("Import is still running. Open Trigger Runs for live logs.");
     }
@@ -55,7 +55,7 @@ export default function HomePage() {
         return;
       }
       if (result.status === "failed") {
-        setMessages((items) => [...items, { role: "assistant", text: result.error_message ?? "Analysis failed; inspect the Trigger run logs." }]);
+        setMessages((items) => [...items, { role: "assistant", text: "Analysis failed; inspect the Trigger run logs." }]);
         return;
       }
     }

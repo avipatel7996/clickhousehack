@@ -9,7 +9,7 @@ export async function GET(request: Request) {
   if (!supabase) return NextResponse.json({ error: "Analysis storage is not configured" }, { status: 404 });
   const user = await getAuthenticatedUser(supabase);
   if (!user) return NextResponse.json({ error: "Authentication required" }, { status: 401 });
-  const { data, error } = await supabase.from("analysis_runs").select("id,status,answer,error_message,trigger_run_id,created_at").eq("id", id).single();
+  const { data, error } = await supabase.from("analysis_runs").select("id,status,answer,created_at").eq("id", id).single();
   if (error) return NextResponse.json({ error: error.message }, { status: 404 });
   return NextResponse.json(data);
 }
@@ -45,6 +45,6 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: message, analysisId, live: false }, { status: 503 });
   }
   if (supabase && dispatch.runId) await supabase.from("analysis_runs").update({ trigger_run_id: dispatch.runId }).eq("id", analysisId);
-  if (supabase && dispatch.error) await supabase.from("analysis_runs").update({ status: "failed", error_message: dispatch.error }).eq("id", analysisId);
+  if (supabase && dispatch.error) await supabase.from("analysis_runs").update({ status: "failed" }).eq("id", analysisId);
   return NextResponse.json({ status: dispatch.error ? "failed" : "queued", analysisId, workspaceId, triggerRunId: dispatch.runId, live: dispatch.enabled && !dispatch.error, warning: dispatch.error ?? (dispatch.enabled ? undefined : "Trigger.dev is not configured") }, { status: dispatch.error ? 502 : 202 });
 }
