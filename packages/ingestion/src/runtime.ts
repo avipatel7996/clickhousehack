@@ -33,6 +33,34 @@ function parseListing(stdout: string): Array<{ path: string; sizeBytes: number; 
 }
 
 export interface KaggleCliOptions { executable?: string; execFile?: ExecFile; tempDir?: string }
+
+/** Kaggle's HTTP API adapter. This avoids relying on a Python executable in a
+ * managed Trigger worker; the API token is supplied as a Bearer credential. */
+export class KaggleApiGateway implements KaggleGateway {
+  constructor(private readonly options: { token: string; baseUrl?: string; fetch?: typeof globalThis.fetch }) {
+    if (!options.token) throw new Error('KAGGLE_API_TOKEN is required');
+  }
+  private get fetchImpl() { return this.options.fetch ?? globalThis.fetch; }
+  private apiUrl(path: string) { return `${(this.options.baseUrl ?? 'https://www.kaggle.com/api/v1').replace(/\/$/, '')}/${path}`; }
+  async list(ref: KaggleDatasetRef) {
+    const version = ref.version ?? 1;
+    const response = await this.fetchImpl(this.apiUrl(`datasets/list/${encodeURIComponent(ref.owner)}/${encodeURIComponent(ref.slug)}`), { headers: { Authorization: `Bearer ${this.options.token}` } });
+    if (!response.ok) throw new Error(`Kaggle API listing failed (${response.status}): ${await response.text()}`);
+    const body = await response.json() as { datasetFiles?: Array<{ name?: string; totalBytes?: number; ref?: string }> };
+    const files = (body.datasetFiles ?? []).map((file) => ({
+      path: String(file.name ?? ''), sizeBytes: Number(file.totalBytes ?? 0), etag: file.ref || undefined,
+      download: () => this.download(ref, String(file.name ?? '')),
+    })).filter((file) => file.path);
+    return { version, files };
+  }
+  private async download(ref: KaggleDatasetRef, path: string): Promise<Uint8Array> {
+    if (!path || path.startsWith('/') || path.split('/').includes('..')) throw new Error('Unsafe Kaggle file path');
+    const response = await this.fetchImpl(this.apiUrl(`datasets/download/${encodeURIComponent(ref.owner)}/${encodeURIComponent(ref.slug)}/${path.split('/').map(encodeURIComponent).join('/')}`), { headers: { Authorization: `Bearer ${this.options.token}` } });
+    if (!response.ok) throw new Error(`Kaggle API download failed (${response.status}): ${await response.text()}`);
+    return new Uint8Array(await response.arrayBuffer());
+  }
+}
+
 export class KaggleCliGateway implements KaggleGateway {
   private readonly executable: string; private readonly run: ExecFile; private readonly tempDir?: string;
   constructor(options: KaggleCliOptions = {}) { this.executable = options.executable ?? 'kaggle'; this.run = options.execFile ?? defaultExec; this.tempDir = options.tempDir; }
