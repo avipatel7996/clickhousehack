@@ -42,6 +42,9 @@ importers:
       '@trigger.dev/build':
         specifier: 4.5.7
         version: 4.5.7(magicast@0.3.5)(supports-color@10.2.2)(typescript@5.9.3)
+      '@trigger.dev/python':
+        specifier: 4.5.7
+        version: 4.5.7(@trigger.dev/build@4.5.7(magicast@0.3.5)(typescript@5.9.3))(@trigger.dev/sdk@4.5.7(react@19.2.8)(zod@3.25.76))
       '@types/node':
         specifier: ^22.15.0
         version: 22.20.1
@@ -1087,6 +1090,13 @@ packages:
   '@trigger.dev/core@4.5.7':
     resolution: {integrity: sha512-Q5vI1zLtIxZMLq3LzdbrWNHtLkhyIvUtQ1toX0Bayn71RdMraTl3zhB95I/6LHuz7ZS7HSyO/zDy6Cs0gIm5rw==}
     engines: {node: '>=18.20.0'}
+
+  '@trigger.dev/python@4.5.7':
+    resolution: {integrity: sha512-wsYXyMwjuUZKh9KCdpwf8wxj7qB3WIAB3MfTf4CtEf0HIvSebtWyxHWSB1BIdAuc/4ofhrZRzliSvt/z5rQy6g==}
+    engines: {node: '>=18.20.0'}
+    peerDependencies:
+      '@trigger.dev/build': ^4.5.7
+      '@trigger.dev/sdk': ^4.5.7
 
   '@trigger.dev/schema-to-json@4.5.7':
     resolution: {integrity: sha512-Dxf4Sne20faYzycLeycHGNyTLR5gXbqSB0xRQcz67KWzCeUhuNd5j+dIQ2+brwy6hFCoHbt8+Ar0MTIv8Ce1hQ==}
@@ -3526,6 +3536,17 @@ snapshots:
       zod: 3.25.76
       zod-error: 1.5.0
       zod-validation-error: 1.5.0(zod@3.25.76)
+    transitivePeerDependencies:
+      - bufferutil
+      - supports-color
+      - utf-8-validate
+
+  '@trigger.dev/python@4.5.7(@trigger.dev/build@4.5.7(magicast@0.3.5)(typescript@5.9.3))(@trigger.dev/sdk@4.5.7(react@19.2.8)(zod@3.25.76))':
+    dependencies:
+      '@trigger.dev/build': 4.5.7(magicast@0.3.5)(supports-color@10.2.2)(typescript@5.9.3)
+      '@trigger.dev/core': 4.5.7(supports-color@10.2.2)
+      '@trigger.dev/sdk': 4.5.7(react@19.2.8)(zod@3.25.76)
+      tinyexec: 0.3.2
     transitivePeerDependencies:
       - bufferutil
       - supports-color
