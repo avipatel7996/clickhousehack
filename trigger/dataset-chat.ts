@@ -180,6 +180,12 @@ function latestUserQuestion(messages: unknown[]): string | undefined {
   return undefined;
 }
 
+function isLiteralEntitySearchTerm(value: string) {
+  const analyticalWords = new Set(["top", "bottom", "best", "worst", "highest", "lowest", "player", "players", "record", "records", "match", "matches", "data", "dataset", "performance", "score", "scores", "total", "average", "rank", "ranking", "identify", "list", "show", "find", "compare", "provided"]);
+  const tokens = value.toLowerCase().match(/[a-z]+/g) ?? [];
+  return tokens.length > 0 && tokens.some((token) => !analyticalWords.has(token));
+}
+
 async function createAnalysisPlan(model: LanguageModel, question: string, context: DatasetContext): Promise<AnalysisPlan> {
   const availableColumns = new Set(context.tables.flatMap((source) => source.columns.map((column) => column.name)));
   const fallback: AnalysisPlan = {
@@ -200,13 +206,13 @@ async function createAnalysisPlan(model: LanguageModel, question: string, contex
       schemaName: "analysis_plan",
       schemaDescription: "A minimal, executable plan for a database question.",
       temperature: 0,
-      prompt: `Create the minimum executable evidence plan for this user question: ${JSON.stringify(question)}\n\nAvailable imported tables and columns: ${JSON.stringify(schemaSummary)}\n\nRules:\n- Use one sub-question for a simple aggregate or lookup; add steps only for distinct entities, filters, or dependent evidence. Never add generic filler.\n- Put each distinct person, title, product, player, or other named entity in entityTerms separately.\n- For every required relationship/filter that needs a specific field, add a requirement with the exact matchingColumns from the schema. If the schema has no field that can verify it, use an empty matchingColumns array.\n- Never use world knowledge or invent a schema column.`,
+      prompt: `Create the minimum executable evidence plan for this user question: ${JSON.stringify(question)}\n\nAvailable imported tables and columns: ${JSON.stringify(schemaSummary)}\n\nRules:\n- Use one sub-question for a simple aggregate or lookup; add steps only for distinct entities, filters, or dependent evidence. Never add generic filler.\n- entityTerms is ONLY for literal values that must be found in data, such as a person's name, a named team, a title, or a product. It must be empty for output categories or aggregate instructions such as “top 10 players”, “best products”, “match data”, or “average score”. Put separate literal names in separate entries.\n- For every required relationship/filter that needs a specific field, add a requirement with the exact matchingColumns from the schema. If the schema has no field that can verify it, use an empty matchingColumns array.\n- Never use world knowledge or invent a schema column.`,
     });
     const plan = result.object;
     return {
       objective: plan.objective,
       subquestions: [...new Set(plan.subquestions)].slice(0, 3),
-      entityTerms: [...new Set(plan.entityTerms)].slice(0, 3),
+      entityTerms: [...new Set(plan.entityTerms.filter(isLiteralEntitySearchTerm))].slice(0, 3),
       requirements: plan.requirements.map((requirement) => ({
         purpose: requirement.purpose,
         matchingColumns: requirement.matchingColumns.filter((column) => availableColumns.has(column)),
@@ -221,16 +227,20 @@ function normalizeTerm(term: string) {
   return term.length > 3 && term.endsWith("s") ? term.slice(0, -1) : term;
 }
 
-function isUnfilteredRatingRecommendation(question: string, context: DatasetContext) {
+function questionTerms(question: string) {
+  const ignored = new Set(["a", "an", "and", "are", "based", "best", "bottom", "can", "data", "do", "find", "give", "good", "highest", "identify", "in", "is", "list", "lowest", "match", "matches", "of", "on", "please", "provided", "rank", "ranking", "recommend", "recommendation", "results", "show", "some", "suggest", "the", "to", "top", "what", "which", "with", "you"]);
+  return (question.toLowerCase().match(/[a-z][a-z0-9]*/g) ?? [])
+    .map(normalizeTerm)
+    .filter((term) => !ignored.has(term));
+}
+
+function isUnfilteredRankingRequest(question: string) {
   const text = question.toLowerCase();
-  const asksForRecommendation = /\b(suggest|recommend|good|best|top|highest|highly rated|watch)\b/.test(text);
-  const hasSpecificFilter = /\b(by|with|near|from|in|after|before|between|under|over|above|for)\b/.test(text) || /\b\d{4}\b/.test(text);
-  const genericWords = new Set(["a", "an", "and", "are", "based", "best", "can", "do", "for", "give", "good", "highest", "highly", "i", "me", "on", "please", "rated", "rating", "ratings", "recommend", "recommendation", "recommendations", "recommended", "should", "show", "some", "suggest", "suggestion", "suggestions", "the", "to", "top", "us", "watch", "what", "which", "you"]);
-  const datasetTerms = new Set(context.tables.flatMap((source) => [source.table, source.sourcePath ?? "", ...source.columns.map((column) => column.name)]).flatMap((value) => value.toLowerCase().match(/[a-z0-9]+/g) ?? []).map(normalizeTerm));
-  const topicWords = (text.match(/[a-z0-9]+/g) ?? []).filter((word) => !genericWords.has(word));
-  // Keep the fast path narrow: unknown topic words (a person, location, genre,
-  // or arbitrary filter) must go through the general evidence workflow first.
-  return asksForRecommendation && !hasSpecificFilter && topicWords.length > 0 && topicWords.every((word) => datasetTerms.has(normalizeTerm(word)));
+  const asksForRanking = /\b(top|bottom|best|worst|highest|lowest|leading|recommend|suggest|good)\b/.test(text);
+  // A named constraint needs the general evidence workflow. A bare ranking is
+  // fully determined by schema semantics and can avoid an LLM call altogether.
+  const hasConstraint = /\b(where|with|for|from|near|after|before|between|under|over|above|below|against|versus|vs)\b/.test(text) || /\b\d{4}\b/.test(text);
+  return asksForRanking && !hasConstraint;
 }
 
 function firstColumn(columns: DatasetColumn[], names: string[]) {
@@ -242,17 +252,67 @@ function firstColumn(columns: DatasetColumn[], names: string[]) {
   return undefined;
 }
 
-function entityColumn(columns: DatasetColumn[]) {
-  return firstColumn(columns, ["title", "name", "label", "product_name", "item_name", "restaurant_name", "company_name", "artist_name", "player_name", "original_title"])
-    ?? columns.find((column) => /(^|_)(name|title|label)$/i.test(column.name))?.name;
+function entityColumns(columns: DatasetColumn[]) {
+  return columns.filter((column) => /(^|[_-])(name|title|label)$/i.test(column.name));
 }
 
-type RatingRecommendationSource = {
+function isNumericColumn(column: DatasetColumn) {
+  return /int|float|decimal|double|numeric|real|uint/i.test(column.type);
+}
+
+function columnTerms(column: string) {
+  return column.toLowerCase().split(/[_-]+/).map(normalizeTerm).filter(Boolean);
+}
+
+function rankingLimit(question: string) {
+  const numeric = question.match(/\b(?:top|bottom|best|worst|highest|lowest|leading)\s+(\d{1,2})\b/i);
+  if (numeric) return Math.min(25, Math.max(1, Number(numeric[1])));
+  const named = question.match(/\b(?:top|bottom|best|worst|highest|lowest|leading)\s+(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b/i)?.[1]?.toLowerCase();
+  const wordNumbers: Record<string, number> = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10, eleven: 11, twelve: 12 };
+  return named ? wordNumbers[named] : 10;
+}
+
+function rankingDirection(question: string) {
+  return /\b(bottom|worst|lowest)\b/i.test(question) ? "ASC" : "DESC";
+}
+
+function entityScore(column: DatasetColumn, terms: string[]) {
+  const matches = columnTerms(column.name).filter((term) => terms.includes(term)).length;
+  return 20 + matches * 30 + (/name|title|label/i.test(column.name) ? 10 : 0);
+}
+
+function metricScore(column: DatasetColumn, terms: string[]) {
+  if (!isNumericColumn(column)) return Number.NEGATIVE_INFINITY;
+  const name = column.name.toLowerCase();
+  const words = columnTerms(name);
+  const relevance = words.filter((term) => terms.includes(term)).length * 40;
+  const quality = /performance|rating|score|rank|grade|points|value|revenue|sales|goals|assists|amount|count|volume/i.test(name) ? 30 : 0;
+  const preferred = /^(performance|overall|composite|quality)[_-]score$/i.test(column.name) ? 60
+    : /(?:^|[_-])rating$/i.test(column.name) || /^(average_rating|vote_average|imdb_rating)$/i.test(column.name) ? 50
+      : /(?:^|[_-])score$/i.test(column.name) ? 40 : 0;
+  const identifierPenalty = /(^|_)(id|number|year|age)$/i.test(name) ? -80 : 0;
+  return relevance + quality + preferred + identifierPenalty;
+}
+
+function observationColumn(columns: DatasetColumn[]) {
+  return firstColumn(columns, ["match_id", "game_id", "event_id", "transaction_id", "order_id", "session_id", "record_id"]);
+}
+
+function displayEntityLabel(column: string) {
+  const withoutName = column.replace(/(?:[_-]name|[_-]title|[_-]label)$/i, "") || column;
+  return humanizeColumn(withoutName);
+}
+
+function displayObservationLabel(column: string | undefined) {
+  if (!column) return "Records";
+  return humanizeColumn(column.replace(/(?:[_-]id)$/i, "") || column);
+}
+
+type RankingSource = {
   source: DatasetTable;
   entity: string;
-  rating: string;
-  votes: string | undefined;
-  release: string | undefined;
+  metric: string;
+  observation: string | undefined;
   score: number;
 };
 
@@ -260,55 +320,74 @@ function humanizeColumn(name: string) {
   return name.replace(/[_-]+/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
-async function prepareRatingRecommendations(context: DatasetContext, question: string): Promise<AnalystInsight | null> {
-  if (!isUnfilteredRatingRecommendation(question, context)) return null;
-  const candidates = context.tables.map((source) => {
-    const entity = entityColumn(source.columns);
-    const rating = firstColumn(source.columns, ["vote_average", "rating", "imdb_rating", "score"]);
-    const votes = firstColumn(source.columns, ["vote_count", "votes", "rating_count", "review_count"]);
-    const release = firstColumn(source.columns, ["release_date", "release_year", "year", "date"]);
-    return { source, entity, rating, votes, release, score: Number(Boolean(entity)) + Number(Boolean(rating)) * 4 + Number(Boolean(votes)) * 2 + Number(rating === "vote_average") * 2 };
-  }).filter((candidate): candidate is RatingRecommendationSource => Boolean(candidate.entity && candidate.rating));
+async function prepareUnfilteredRanking(context: DatasetContext, question: string): Promise<AnalystInsight | null> {
+  if (!isUnfilteredRankingRequest(question)) return null;
+  const terms = questionTerms(question);
+  const candidates = context.tables.flatMap((source) => entityColumns(source.columns).flatMap((entity) => source.columns
+    .filter(isNumericColumn)
+    .map((metric) => ({
+      source,
+      entity: entity.name,
+      metric: metric.name,
+      observation: observationColumn(source.columns),
+      // Terms that identify the grouped entity (e.g. "player" in
+      // player_name) are not evidence that player_rating is the requested
+      // measure. Keep dimension matching and metric matching separate.
+      score: entityScore(entity, terms) + metricScore(metric, terms.filter((term) => !columnTerms(entity.name).includes(term))),
+    })))).filter((candidate): candidate is RankingSource => Number.isFinite(candidate.score) && candidate.score > 0);
   const target = candidates.sort((left, right) => right.score - left.score)[0];
   if (!target) return null;
 
+  const limit = rankingLimit(question);
+  const direction = rankingDirection(question);
   const workflow = createWorkflowReporter();
-  workflow.status("planning", "Planning a four-step rating-based recommendation workflow");
-  workflow.event("planning", "1/4 Identified an unfiltered rating recommendation", "completed");
-  const source = await workflow.activity("inspecting", "2/4 Mapping entity, rating, and review columns", async () => target, (value) => `Mapped ${value.entity}, ${value.rating}${value.votes ? `, and ${value.votes}` : ""}`);
+  const entityLabel = displayEntityLabel(target.entity);
+  const metricLabel = humanizeColumn(target.metric);
+  const observationLabel = displayObservationLabel(target.observation);
+  chat.response.write({
+    type: "data-analysis-plan",
+    id: `analysis-plan-${crypto.randomUUID()}`,
+    data: {
+      objective: `Rank ${entityLabel.toLowerCase()} records using the available ${metricLabel.toLowerCase()} data.`,
+      subquestions: [`Aggregate ${metricLabel} by ${entityLabel}, then return the ${direction === "ASC" ? "lowest" : "highest"} ${limit}.`],
+      entityTerms: [],
+      requirements: [
+        { purpose: "Group the records by entity", matchingColumns: [target.entity] },
+        { purpose: "Aggregate the ranking metric", matchingColumns: [target.metric] },
+      ],
+    } satisfies AnalysisPlan,
+  } as never);
+  workflow.status("planning", "Planning one schema-driven aggregate");
+  workflow.event("planning", "1/3 Classified this as an unfiltered ranking", "completed");
+  const source = await workflow.activity("inspecting", "2/3 Mapping the entity and performance columns", async () => target, (value) => `Mapped ${value.entity} and ${value.metric}${value.observation ? ` across ${value.observation}` : ""}`);
   const clickhouse = new ClickHouseClient(createClickHouseConfig());
   const entity = quoteIdentifier(source.entity);
-  const rating = quoteIdentifier(source.rating);
-  const votes = source.votes ? quoteIdentifier(source.votes) : undefined;
-  const release = source.release ? quoteIdentifier(source.release) : undefined;
-  const ratingValue = floatOrNull(rating);
-  const voteValue = votes ? intOrNull(votes) : undefined;
-  const voteSelect = voteValue ? `, max(${voteValue}) AS review_count` : "";
-  const yearSelect = release ? `, max(toYear(parseDateTimeBestEffortOrNull(toString(${release})))) AS release_year` : "";
-  const voteOrder = voteValue ? ", review_count DESC" : "";
-  const sql = `SELECT ${entity} AS entity_name, max(${ratingValue}) AS entity_rating${voteSelect}${yearSelect} FROM ${source.source.table} WHERE ${entity} IS NOT NULL AND ${ratingValue} IS NOT NULL GROUP BY ${entity} ORDER BY entity_rating DESC${voteOrder} LIMIT 8`;
-  const result = await workflow.activity("querying", "3/4 Ranking records by their dataset rating", async () => {
+  const metric = quoteIdentifier(source.metric);
+  const metricValue = floatOrNull(metric);
+  const observation = source.observation ? quoteIdentifier(source.observation) : undefined;
+  const observationSelect = observation ? `, countDistinct(${observation}) AS observation_count` : ", count() AS observation_count";
+  const sql = `SELECT ${entity} AS entity_name, avg(${metricValue}) AS aggregate_metric${observationSelect} FROM ${source.source.table} WHERE ${entity} IS NOT NULL AND ${metricValue} IS NOT NULL GROUP BY ${entity} ORDER BY aggregate_metric ${direction}, observation_count DESC LIMIT ${limit}`;
+  const result = await workflow.activity("ranking", "3/3 Aggregating and ranking the imported records", async () => {
     const verified = validateReadOnlySql(sql, context.tables.map((table) => table.table));
     if (!verified.ok) throw new Error(verified.error);
     return clickhouse.query<Record<string, unknown>>(sql, { timeoutMs: 15_000 });
-  }, (value) => `ClickHouse returned ${value.rows.length} recommendation${value.rows.length === 1 ? "" : "s"}`);
+  }, (value) => `ClickHouse returned ${value.rows.length} ranked record${value.rows.length === 1 ? "" : "s"}`);
   if (!result.rows.length) return null;
   const number = (value: unknown) => Number.isFinite(Number(value)) ? Number(value) : 0;
   const rows = result.rows.map((row) => ({
     entity: String(row.entity_name ?? "Untitled"),
-    rating: number(row.entity_rating),
-    reviews: number(row.review_count),
-    year: number(row.release_year) || null,
+    metric: number(row.aggregate_metric),
+    observations: number(row.observation_count),
   }));
-  const entityLabel = humanizeColumn(source.entity);
-  workflow.event("answering", "4/4 Rendered an evidence-backed recommendation list", "completed");
-  workflow.status("answering", "Streaming your recommendations");
+  workflow.event("answering", "Rendered an evidence-backed ranking", "completed");
+  workflow.status("answering", "Streaming the verified ranking");
+  const rankingTitle = `${direction === "ASC" ? "Lowest" : "Top"} ${rows.length} ${entityLabel}${/s$/i.test(entityLabel) ? "" : "s"}`;
   return {
-    title: "Highly rated recommendations",
-    summary: `These are ranked by the dataset's ${humanizeColumn(source.rating)}${voteValue ? "; review count breaks rating ties and is shown for context" : ""}.`,
-    cards: rows.slice(0, 3).map((row) => ({ label: row.entity, value: String(Number(row.rating.toFixed(2))), detail: row.reviews ? `${row.reviews.toLocaleString()} reviews${row.year ? ` · ${row.year}` : ""}` : row.year ? String(row.year) : undefined })),
-    table: { columns: [entityLabel, "Rating", "Reviews", "Year"], rows: rows.map((row) => ({ [entityLabel]: row.entity, Rating: String(Number(row.rating.toFixed(2))), Reviews: row.reviews ? row.reviews.toLocaleString() : "—", Year: row.year ?? "—" })) },
-    caveat: `Source: ${source.source.sourcePath ?? source.source.table}. Ask for a specific filter to narrow this further.`,
+    title: rankingTitle,
+    summary: `Ranked by average ${metricLabel} across each ${observationLabel.toLowerCase()} in the imported data. The number of ${observationLabel.toLowerCase()} records breaks ties.`,
+    cards: rows.slice(0, 3).map((row) => ({ label: row.entity, value: String(Number(row.metric.toFixed(2))), detail: `${row.observations.toLocaleString()} ${observationLabel.toLowerCase()} record${row.observations === 1 ? "" : "s"}` })),
+    table: { columns: [entityLabel, `Average ${metricLabel}`, `${observationLabel} Records`], rows: rows.map((row) => ({ [entityLabel]: row.entity, [`Average ${metricLabel}`]: Number(row.metric.toFixed(2)), [`${observationLabel} Records`]: row.observations })) },
+    caveat: `Source: ${source.source.sourcePath ?? source.source.table}. This is a schema-driven aggregate, not a text search or outside-knowledge recommendation.`,
   };
 }
 
@@ -393,11 +472,9 @@ async function executeAnalysisPlan(context: DatasetContext, plan: AnalysisPlan) 
 }
 
 function blockerInsight(question: string, plan: AnalysisPlan, results: SearchResult[]): AnalystInsight | null {
-  const unsupported = plan.requirements.filter((requirement) => !requirement.matchingColumns.length);
   const missing = results.filter((result) => !result.rowCount);
-  if (!unsupported.length && !missing.length) return null;
+  if (!missing.length) return null;
   const rows = [
-    ...unsupported.map((requirement) => ({ Check: requirement.purpose, Outcome: "No matching field in this dataset" })),
     ...missing.map((result) => ({ Check: `Find “${result.query}”`, Outcome: "No matching values in imported text fields" })),
   ];
   return {
@@ -539,9 +616,19 @@ export const datasetChat = chat
       if (!clientData) throw new Error("Dataset context is required");
       const context = datasetContext.get();
       const question = latestUserQuestion(messages);
-      const recommendation = question ? await prepareRatingRecommendations(context, question) : null;
+      const directInsight = question ? await prepareUnfilteredRanking(context, question) : null;
+      // A bare aggregate is already fully answered by a verified ClickHouse
+      // query. Finishing here avoids an unnecessary model request entirely.
+      if (directInsight) {
+        chat.response.write({
+          type: "data-analyst-insight",
+          id: "analyst-insight",
+          data: directInsight,
+        } as never);
+        return;
+      }
       const model = resolveChatModel(clientData);
-      const planner = question && !recommendation ? createWorkflowReporter() : undefined;
+      const planner = question ? createWorkflowReporter() : undefined;
       const plan = question && planner ? await planner.activity(
         "planning",
         "Creating the minimum evidence plan",
@@ -557,19 +644,13 @@ export const datasetChat = chat
       }
       const plannedEvidence = plan ? await executeAnalysisPlan(context, plan) : [];
       const blocker = question && plan ? blockerInsight(question, plan, plannedEvidence) : null;
-      if (recommendation) {
-        chat.response.write({
-          type: "data-analyst-insight",
-          id: "analyst-insight",
-          data: recommendation,
-        } as never);
-      }
       if (blocker) {
         chat.response.write({
           type: "data-analyst-insight",
           id: "analyst-blocker",
           data: blocker,
         } as never);
+        return;
       }
       const streamOptions = chat.toStreamTextOptions({ tools });
       const preflight = plan ? JSON.stringify({
@@ -581,20 +662,15 @@ export const datasetChat = chat
         // Gemini is selected per session; Featherless retains its fast
         // non-reasoning default for sessions that do not opt into Gemini.
         model,
-        system: `You are a precise, fast data analyst for arbitrary imported datasets. Answer only from ClickHouse results. Dataset tables and schemas: ${JSON.stringify(context.tables)}. The orchestrator has already created and executed this evidence plan: ${preflight}. Use those completed checks; do not repeat them. If a blocker is present, do not call tools or emit text because the structured blocker is the final answer. Otherwise, identify the relevant table and requested constraints; resolve any additional named entity with its own search_records call before querying; run a bounded read-only query that applies every supported constraint; compare the result with the original question before answering, and explicitly state unsupported constraints or zero evidence. search_records searches every imported text field using substring matching. If it finds nothing, say what was searched and never infer an identity from outside knowledge. If it finds multiple candidates, state the candidates and the data-backed reason for any selection before continuing. Never repeat an identical tool call. Use rank_entities only for multi-metric rankings and select its table explicitly when necessary. Do not inspect the dataset unless a sample is necessary. End every non-blocked workflow with present_insight: it is the final answer contract and must include either verified results or a precise data limitation. ${recommendation ? "A verified generic rating recommendation table has already been emitted. Do not call tools or emit text; the structured result is the complete answer." : blocker ? "A structured blocker has already been emitted. Do not call tools or emit text." : "Keep any supporting text under 120 words."} Do not describe hidden reasoning. Never invent facts.`,
+        system: `You are a precise, fast data analyst for arbitrary imported datasets. Answer only from ClickHouse results. Dataset tables and schemas: ${JSON.stringify(context.tables)}. The orchestrator has already created and executed this evidence plan: ${preflight}. Use those completed checks; do not repeat them. Identify the relevant table and requested constraints; resolve only literal named values with search_records. Never search output categories or aggregate instructions such as “top 10 players”; directly aggregate using schema columns instead. Run a bounded read-only query that applies every supported constraint; compare the result with the original question before answering, and explicitly state unsupported constraints or zero evidence. search_records searches every imported text field using substring matching. If it finds nothing, say what was searched and never infer an identity from outside knowledge. If it finds multiple candidates, state the candidates and the data-backed reason for any selection before continuing. Never repeat an identical tool call. Use rank_entities only for multi-metric rankings and select its table explicitly when necessary. Do not inspect the dataset unless a sample is necessary. End every workflow with present_insight: it is the final answer contract and must include either verified results or a precise data limitation. Keep any supporting text under 120 words. Do not describe hidden reasoning. Never invent facts.`,
         messages,
         abortSignal: signal,
-        maxOutputTokens: recommendation ? 100 : 240,
+        maxOutputTokens: 240,
         temperature: 0,
-        ...(recommendation || blocker ? {
-          toolChoice: "none" as const,
-          stopWhen: stepCountIs(1),
-        } : {
-          stopWhen: stepCountIs(4),
-        }),
+        stopWhen: stepCountIs(4),
         onFinish: async (event) => {
           const producedInsight = event.steps.some((step) => step.toolCalls.some((call) => call.toolName === "present_insight"));
-          if (!recommendation && !blocker && !event.text.trim() && !producedInsight) {
+          if (!event.text.trim() && !producedInsight) {
             chat.response.write({
               type: "data-analyst-insight",
               id: "analyst-incomplete-workflow",
