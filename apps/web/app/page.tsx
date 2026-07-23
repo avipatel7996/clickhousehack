@@ -1,15 +1,13 @@
 "use client";
 
 import { FormEvent, useEffect, useState } from "react";
+import { DatasetAgentChat } from "./dataset-agent-chat";
 
-type Message = { role: "user" | "assistant"; text: string };
 type Dataset = { id: string; canonical_ref: string; status: string; row_count?: number | null };
 
 export default function HomePage() {
   const [url, setUrl] = useState("");
   const [importStatus, setImportStatus] = useState("");
-  const [question, setQuestion] = useState("");
-  const [messages, setMessages] = useState<Message[]>([]);
   const [datasets, setDatasets] = useState<Dataset[]>([]);
   const [datasetId, setDatasetId] = useState("");
   useEffect(() => { refreshDatasets(); }, []);
@@ -44,37 +42,6 @@ export default function HomePage() {
     }
   }
 
-  async function askQuestion(event: FormEvent) {
-    event.preventDefault();
-    if (!question.trim()) return;
-    const current = question;
-    setQuestion("");
-    setMessages((items) => [...items, { role: "user", text: current }]);
-    const response = await fetch("/api/analyses", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ question: current, datasetId: datasetId || undefined }) });
-    const body = await response.json();
-    if (!response.ok || body.status === "failed") {
-      setMessages((items) => [...items, { role: "assistant", text: body.warning ?? body.error ?? "Analysis could not be queued." }]);
-      return;
-    }
-    setMessages((items) => [...items, { role: "assistant", text: "Analysis queued; waiting for the ClickHouse-backed result…" }]);
-    for (let attempt = 0; attempt < 90; attempt++) {
-      await new Promise((resolve) => setTimeout(resolve, 2000));
-      const poll = await fetch(`/api/analyses?id=${encodeURIComponent(body.analysisId)}`);
-      if (!poll.ok) continue;
-      const result = await poll.json();
-      if (result.status === "completed") {
-        const answer = result.answer?.answer ?? result.answer?.result?.answer ?? "Analysis completed.";
-        setMessages((items) => [...items, { role: "assistant", text: `${String(answer)} (finished)` }]);
-        return;
-      }
-      if (result.status === "failed") {
-        setMessages((items) => [...items, { role: "assistant", text: "Analysis failed; inspect the Trigger run logs." }]);
-        return;
-      }
-    }
-    setMessages((items) => [...items, { role: "assistant", text: "Analysis is still running. Open Trigger Runs for live logs." }]);
-  }
-
   return <main style={{ maxWidth: 920, margin: "0 auto", padding: "48px 24px", fontFamily: "system-ui" }}>
     <p style={{ color: "#64748b", letterSpacing: 1 }}>KAGGLE → CLICKHOUSE · <a href="/login">Sign in</a></p>
     <h1>Ask your data, with evidence.</h1>
@@ -85,11 +52,10 @@ export default function HomePage() {
       {importStatus && <p role="status">{importStatus}</p>}
     </section>
     <section style={{ marginTop: 24, padding: 24, border: "1px solid #e2e8f0", borderRadius: 12 }}>
-      <h2>2. Ask a grounded question</h2>
-      <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 12 }}><button type="button" onClick={refreshDatasets}>Refresh datasets</button><select value={datasetId} onChange={(event) => setDatasetId(event.target.value)} style={{ flex: 1, padding: 10 }}><option value="">Select an imported dataset</option>{datasets.map((dataset) => <option key={dataset.id} value={dataset.id}>{dataset.canonical_ref} ({dataset.row_count ?? "?"} rows)</option>)}</select></div>
-      <form onSubmit={askQuestion} style={{ display: "flex", gap: 12 }}><input value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="Which team has the strongest evidence?" style={{ flex: 1, padding: 12 }} /><button type="submit">Analyze</button></form>
-      <div aria-live="polite">{messages.map((message, index) => <p key={index}><strong>{message.role === "user" ? "You" : "Analyst"}:</strong> {message.text}</p>)}</div>
+      <h2>2. Choose a dataset</h2>
+      <div style={{ display: "flex", gap: 12, alignItems: "center" }}><button type="button" onClick={refreshDatasets}>Refresh datasets</button><select value={datasetId} onChange={(event) => setDatasetId(event.target.value)} style={{ flex: 1, padding: 10 }}><option value="">Select an imported dataset</option>{datasets.map((dataset) => <option key={dataset.id} value={dataset.id}>{dataset.canonical_ref} ({dataset.row_count ?? "?"} rows)</option>)}</select></div>
     </section>
+    {datasetId && <DatasetAgentChat key={datasetId} datasetId={datasetId} datasetName={datasets.find((dataset) => dataset.id === datasetId)?.canonical_ref ?? "selected dataset"} />}
     <small style={{ display: "block", marginTop: 24, color: "#64748b" }}>Forecasts are only produced when the dataset contains suitable historical outcomes and predictors. Otherwise the analyst explains what the data can support.</small>
   </main>;
 }
