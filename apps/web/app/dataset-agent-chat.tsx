@@ -16,6 +16,7 @@ type Insight = {
 };
 type AgentStatus = { stage: string; message: string; at: string };
 type AgentEvent = { stage: string; message: string; state: "started" | "completed" | "failed"; at: string };
+type ChatActivity = Pick<AgentStatus, "stage" | "message">;
 
 function formatTime(value: string) {
   const date = new Date(value);
@@ -61,15 +62,16 @@ function WorkTrace({ parts }: { parts: any[] }) {
   </details>;
 }
 
-function WorkflowTrace({ parts, busy }: { parts: any[]; busy: boolean }) {
-  const status = statusFromParts(parts) ?? (busy ? { stage: "planning", message: "Connecting to the analyst", at: new Date().toISOString() } : undefined);
+function WorkflowTrace({ parts, activity }: { parts: any[]; activity: ChatActivity | null }) {
+  const status = activity ? (statusFromParts(parts) ?? { ...activity, at: "" }) : undefined;
   const events = eventsFromParts(parts);
   if (!status && !events.length) return null;
-  const color = status?.stage === "error" ? "#b91c1c" : busy ? "#0369a1" : "#166534";
-  return <aside style={{ marginTop: 10, padding: 12, border: `1px solid ${busy ? "#bae6fd" : "#bbf7d0"}`, borderRadius: 10, background: busy ? "#f0f9ff" : "#f0fdf4" }}>
-    <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}><strong style={{ color }}>Analyst workflow</strong><small style={{ color }}>{busy ? "LIVE" : "COMPLETE"}</small></div>
-    {status && <p style={{ margin: "6px 0 0", color: "#334155" }}>{status.message}</p>}
-    <details open={busy || status?.stage === "error"} style={{ marginTop: 8 }}><summary style={{ cursor: "pointer", fontWeight: 600 }}>Timeline · {events.length} event{events.length === 1 ? "" : "s"}</summary><div style={{ maxHeight: 220, overflowY: "auto", marginTop: 8, padding: 10, borderRadius: 6, background: "#0f172a", color: "#e2e8f0", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12, lineHeight: 1.55 }}>{events.length ? events.map((event, index) => <div key={`${event.at}-${index}`} style={{ display: "grid", gridTemplateColumns: "72px 88px minmax(0, 1fr)", gap: 8, padding: "2px 0", borderBottom: "1px solid #1e293b" }}><span style={{ color: "#94a3b8" }}>{formatTime(event.at)}</span><span style={{ color: event.state === "failed" ? "#fca5a5" : event.state === "completed" ? "#86efac" : "#7dd3fc" }}>{event.stage}</span><span style={{ overflowWrap: "anywhere" }}>{event.message}</span></div>) : <span style={{ color: "#94a3b8" }}>Waiting for the first workflow event…</span>}</div></details>
+  const active = Boolean(activity);
+  const color = status?.stage === "error" ? "#b91c1c" : active ? "#0369a1" : "#166534";
+  return <aside style={{ marginTop: 10, padding: 12, border: `1px solid ${active ? "#bae6fd" : "#bbf7d0"}`, borderRadius: 10, background: active ? "#f0f9ff" : "#f0fdf4" }}>
+    <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}><strong style={{ color }}>Analyst workflow</strong><small style={{ color }}>{active ? "LIVE" : "COMPLETE"}</small></div>
+    {status && <p aria-live={active ? "polite" : "off"} aria-atomic="true" style={{ margin: "6px 0 0", color: "#334155" }}>{status.message}</p>}
+    {events.length ? <details open={active || status?.stage === "error"} style={{ marginTop: 8 }}><summary style={{ cursor: "pointer", fontWeight: 600 }}>Timeline · {events.length} event{events.length === 1 ? "" : "s"}</summary><div style={{ maxHeight: 220, overflowY: "auto", marginTop: 8, padding: 10, borderRadius: 6, background: "#0f172a", color: "#e2e8f0", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12, lineHeight: 1.55 }}>{events.map((event, index) => <div key={`${event.at}-${index}`} style={{ display: "grid", gridTemplateColumns: "72px 88px minmax(0, 1fr)", gap: 8, padding: "2px 0", borderBottom: "1px solid #1e293b" }}><span style={{ color: "#94a3b8" }}>{formatTime(event.at)}</span><span style={{ color: event.state === "failed" ? "#fca5a5" : event.state === "completed" ? "#86efac" : "#7dd3fc" }}>{event.stage}</span><span style={{ overflowWrap: "anywhere" }}>{event.message}</span></div>)}</div></details> : null}
   </aside>;
 }
 
@@ -77,13 +79,21 @@ export function DatasetAgentChat({ datasetId, datasetName }: { datasetId: string
   const [chatId] = useState(() => crypto.randomUUID());
   const [input, setInput] = useState("");
   const [transportError, setTransportError] = useState<string | null>(null);
+  const [activity, setActivity] = useState<ChatActivity | null>(null);
   const transport = useTriggerChatTransport({
     task: "dataset-chat",
     clientData: { datasetId },
     accessToken: ({ chatId }) => mintDatasetChatToken(chatId),
     startSession: ({ chatId, clientData }) => startDatasetChat({ chatId, clientData: clientData as { datasetId: string } }),
     onEvent: (event) => {
-      if (event.type === "stream-error" || event.type === "message-send-failed") setTransportError("The analyst connection was interrupted. Please try again.");
+      if (event.type === "message-sent") setActivity({ stage: "planning", message: "Question received — preparing the analyst" });
+      if (event.type === "stream-connected") setActivity({ stage: "planning", message: "Analyst is checking the dataset" });
+      if (event.type === "first-chunk") setActivity({ stage: "answering", message: "Streaming the answer" });
+      if (event.type === "turn-completed") setActivity(null);
+      if (event.type === "stream-error" || event.type === "message-send-failed") {
+        setActivity(null);
+        setTransportError("The analyst connection was interrupted. Please try again.");
+      }
     },
   });
   const { messages, sendMessage, status, stop, error } = useChat({ id: chatId, transport });
@@ -93,15 +103,16 @@ export function DatasetAgentChat({ datasetId, datasetName }: { datasetId: string
     event.preventDefault();
     if (!input.trim() || busy) return;
     setTransportError(null);
+    setActivity({ stage: "planning", message: "Sending your question" });
     sendMessage({ text: input.trim() });
     setInput("");
   };
   return <section style={{ marginTop: 24, padding: 24, border: "1px solid #e2e8f0", borderRadius: 12 }}>
     <h2 style={{ marginTop: 0 }}>Ask {datasetName}</h2>
     <p style={{ color: "#64748b" }}>The agent searches name variations, queries ClickHouse, and returns evidence-backed UI.</p>
-    <div aria-live="polite">{busy && !latestAssistantId && <WorkflowTrace parts={[]} busy />}{messages.map((message: any) => {
-      const isLiveAssistant = busy && message.role === "assistant" && message.id === latestAssistantId;
-      return <div key={message.id} style={{ margin: "16px 0" }}><strong>{message.role === "user" ? "You" : "Analyst"}</strong>{message.role === "assistant" && <WorkflowTrace parts={message.parts ?? []} busy={isLiveAssistant} />}{message.parts?.map((part: any, index: number) => {
+    <div>{activity && !latestAssistantId && <WorkflowTrace parts={[]} activity={activity} />}{messages.map((message: any) => {
+      const isLiveAssistant = Boolean(activity) && message.role === "assistant" && message.id === latestAssistantId;
+      return <div key={message.id} style={{ margin: "16px 0" }}><strong>{message.role === "user" ? "You" : "Analyst"}</strong>{message.role === "assistant" && <WorkflowTrace parts={message.parts ?? []} activity={isLiveAssistant ? activity : null} />}{message.parts?.map((part: any, index: number) => {
         if (part.type === "text") return <p key={index}>{part.text}{isLiveAssistant && <span aria-hidden="true" style={{ color: "#0284c7" }}> ▍</span>}</p>;
         const insight = insightFromPart(part);
         if (insight) return <InsightView key={index} insight={insight} />;
@@ -109,6 +120,6 @@ export function DatasetAgentChat({ datasetId, datasetName }: { datasetId: string
       })}{message.role === "assistant" && <WorkTrace parts={message.parts ?? []} />}</div>;
     })}</div>
     {(error || transportError) && <p role="alert" style={{ marginTop: 12, color: "#b91c1c" }}>{error?.message ?? transportError}</p>}
-    <form onSubmit={submit} style={{ display: "flex", gap: 12, marginTop: 16 }}><input value={input} onChange={(event) => setInput(event.target.value)} placeholder="e.g. Which Nolan movie features Leonardo DiCaprio?" style={{ flex: 1, padding: 12 }} /><button disabled={busy}>{status === "submitted" ? "Connecting…" : status === "streaming" ? "Analysing…" : "Ask"}</button>{busy && <button type="button" onClick={stop}>Stop</button>}</form>
+    <form onSubmit={submit} style={{ display: "flex", gap: 12, marginTop: 16 }}><input value={input} onChange={(event) => setInput(event.target.value)} placeholder="e.g. Which Nolan movie features Leonardo DiCaprio?" style={{ flex: 1, padding: 12 }} /><button disabled={busy}>{status === "submitted" ? "Connecting…" : status === "streaming" ? "Analysing…" : "Ask"}</button>{busy && <button type="button" onClick={() => { setActivity({ stage: "planning", message: "Stopping the analyst" }); stop(); }}>Stop</button>}</form>
   </section>;
 }

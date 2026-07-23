@@ -162,7 +162,14 @@ export const datasetChat = chat
     id: "dataset-chat",
     machine: "small-1x",
     maxDuration: 90,
-    idleTimeoutInSeconds: 60,
+    // A chat session is suspended (not consuming compute) while it waits for
+    // another question. Keep that wait short so abandoned browser tabs do not
+    // look like stuck work in the Trigger dashboard.
+    idleTimeoutInSeconds: 10,
+    turnTimeout: "2m",
+    preloadIdleTimeoutInSeconds: 10,
+    preloadTimeout: "30s",
+    exitAfterPreloadIdle: true,
     uiMessageStreamOptions: {
       sendReasoning: false,
       onError: () => "The analyst could not complete this request. Please try again.",
@@ -188,11 +195,14 @@ export const datasetChat = chat
       const provider = createOpenAI({ apiKey, baseURL: process.env.FEATHERLESS_BASE_URL ?? "https://api.featherless.ai/v1" });
       return streamText({
         ...chat.toStreamTextOptions({ tools }),
-        model: provider.chat(process.env.FEATHERLESS_FAST_MODEL ?? "Qwen/Qwen3-8B"),
-        system: `You are a precise data analyst. Answer only from ClickHouse results. Dataset table: ${context.table}. Columns: ${JSON.stringify(context.columns)}. The schema is already available, so for a straightforward question call query_clickhouse directly with one bounded query, then answer from its result. Use search_records only for names, titles, or fuzzy text lookup; use rank_entities only for multi-metric rankings. Do not inspect the dataset unless the user explicitly asks for a sample or schema. Call present_insight only when a table, chart, or cards materially improve the answer. Never invent facts.`,
+        // Qwen3 enables a hidden reasoning pass by default. For an interactive
+        // query tool this smaller, non-reasoning instruct model gets the first
+        // visible token to the browser much sooner while retaining tool calls.
+        model: provider.chat(process.env.FEATHERLESS_INTERACTIVE_MODEL ?? "Qwen/Qwen2.5-7B-Instruct"),
+        system: `You are a precise, fast data analyst. Answer only from ClickHouse results. Dataset table: ${context.table}. Columns: ${JSON.stringify(context.columns)}. The schema is already available, so for a straightforward question call query_clickhouse directly with one bounded query, then answer from its result. Use search_records only for names, titles, or fuzzy text lookup; use rank_entities only for multi-metric rankings. Do not inspect the dataset unless the user explicitly asks for a sample or schema. Call present_insight only when a table, chart, or cards materially improve the answer. Give the direct result first and keep ordinary answers under 160 words. Do not describe hidden reasoning. Never invent facts.`,
         messages,
         abortSignal: signal,
-        maxOutputTokens: 400,
+        maxOutputTokens: 240,
         temperature: 0,
         stopWhen: stepCountIs(3),
       });
