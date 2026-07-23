@@ -3,7 +3,6 @@
 import { FormEvent, useMemo, useState } from "react";
 import { useChat } from "@ai-sdk/react";
 import { useTriggerChatTransport } from "@trigger.dev/sdk/chat/react";
-import type { datasetChat } from "../../../trigger/dataset-chat";
 import { mintDatasetChatToken, startDatasetChat } from "./actions";
 
 type Scalar = string | number | boolean | null;
@@ -50,11 +49,11 @@ function WorkTrace({ parts }: { parts: any[] }) {
 export function DatasetAgentChat({ datasetId, datasetName }: { datasetId: string; datasetName: string }) {
   const [chatId] = useState(() => crypto.randomUUID());
   const [input, setInput] = useState("");
-  const transport = useTriggerChatTransport<typeof datasetChat>({
+  const transport = useTriggerChatTransport({
     task: "dataset-chat",
     clientData: { datasetId },
     accessToken: ({ chatId }) => mintDatasetChatToken(chatId),
-    startSession: ({ chatId, clientData }) => startDatasetChat({ chatId, clientData }),
+    startSession: ({ chatId, clientData }) => startDatasetChat({ chatId, clientData: clientData as { datasetId: string } }),
     onEvent: (event) => { if (event.type === "stream-error") console.error("Dataset agent stream error", event); },
   });
   const { messages, sendMessage, status, stop } = useChat({ id: chatId, transport });
