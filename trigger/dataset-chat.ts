@@ -1,7 +1,7 @@
 import { chat } from "@trigger.dev/sdk/ai";
 import { createOpenAI } from "@ai-sdk/openai";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
-import { stepCountIs, streamText, tool, type PrepareStepFunction } from "ai";
+import { generateObject, stepCountIs, streamText, tool, type LanguageModel } from "ai";
 import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
 import { ClickHouseClient, createClickHouseConfig, validateReadOnlySql } from "../packages/clickhouse/src";
@@ -145,10 +145,17 @@ type AnalystInsight = {
   caveat: string;
 };
 
-type AnalysisPlan = {
-  objective: string;
-  subquestions: string[];
-};
+const analysisPlanSchema = z.object({
+  objective: z.string().trim().min(3).max(240),
+  subquestions: z.array(z.string().trim().min(3).max(220)).min(1).max(3),
+  entityTerms: z.array(z.string().trim().min(2).max(100)).max(3),
+  requirements: z.array(z.object({
+    purpose: z.string().trim().min(3).max(160),
+    matchingColumns: z.array(z.string().trim().min(1).max(120)).max(8),
+  })).max(3),
+});
+
+type AnalysisPlan = z.infer<typeof analysisPlanSchema>;
 
 function quoteIdentifier(value: string) { return `\`${value.replace(/`/g, "")}\``; }
 
@@ -171,6 +178,43 @@ function latestUserQuestion(messages: unknown[]): string | undefined {
     }
   }
   return undefined;
+}
+
+async function createAnalysisPlan(model: LanguageModel, question: string, context: DatasetContext): Promise<AnalysisPlan> {
+  const availableColumns = new Set(context.tables.flatMap((source) => source.columns.map((column) => column.name)));
+  const fallback: AnalysisPlan = {
+    objective: question,
+    subquestions: ["Run one bounded ClickHouse query that answers the request from the available fields."],
+    entityTerms: [],
+    requirements: [],
+  };
+  try {
+    const schemaSummary = context.tables.slice(0, 12).map((source) => ({
+      source: source.sourcePath ?? source.table,
+      table: source.table,
+      columns: source.columns.slice(0, 80),
+    }));
+    const result = await generateObject({
+      model,
+      schema: analysisPlanSchema,
+      schemaName: "analysis_plan",
+      schemaDescription: "A minimal, executable plan for a database question.",
+      temperature: 0,
+      prompt: `Create the minimum executable evidence plan for this user question: ${JSON.stringify(question)}\n\nAvailable imported tables and columns: ${JSON.stringify(schemaSummary)}\n\nRules:\n- Use one sub-question for a simple aggregate or lookup; add steps only for distinct entities, filters, or dependent evidence. Never add generic filler.\n- Put each distinct person, title, product, player, or other named entity in entityTerms separately.\n- For every required relationship/filter that needs a specific field, add a requirement with the exact matchingColumns from the schema. If the schema has no field that can verify it, use an empty matchingColumns array.\n- Never use world knowledge or invent a schema column.`,
+    });
+    const plan = result.object;
+    return {
+      objective: plan.objective,
+      subquestions: [...new Set(plan.subquestions)].slice(0, 3),
+      entityTerms: [...new Set(plan.entityTerms)].slice(0, 3),
+      requirements: plan.requirements.map((requirement) => ({
+        purpose: requirement.purpose,
+        matchingColumns: requirement.matchingColumns.filter((column) => availableColumns.has(column)),
+      })).slice(0, 3),
+    };
+  } catch {
+    return fallback;
+  }
 }
 
 function normalizeTerm(term: string) {
@@ -302,6 +346,69 @@ function textColumns(source: DatasetTable) {
   return source.columns.filter((column) => /string|fixedstring|lowcardinality|enum/i.test(column.type)).slice(0, 40);
 }
 
+async function searchImportedTextFields(context: DatasetContext, clickhouse: ClickHouseClient, query: string, limit: number): Promise<SearchResult> {
+  const terms = query.toLowerCase().split(/\s+/).filter((term) => term.length > 1).slice(0, 6);
+  if (!terms.length) return { query, rows: [], rowCount: 0, searched: [], note: "No searchable terms supplied" };
+  const sources = context.tables.map((source) => ({ source, columns: textColumns(source) })).filter(({ columns }) => columns.length);
+  const resultSets = await Promise.all(sources.map(async ({ source, columns }) => {
+    const predicates = terms.map((term) => `(${columns.map((column) => `positionCaseInsensitiveUTF8(toString(${quoteIdentifier(column.name)}), ${quote(term)}) > 0`).join(" OR ")})`);
+    const sql = `SELECT *, ${quote(source.sourcePath ?? source.table)} AS _source_file FROM ${source.table} WHERE ${predicates.join(" AND ")} LIMIT ${limit}`;
+    const verified = validateReadOnlySql(sql, [source.table]);
+    if (!verified.ok) throw new Error(verified.error);
+    return clickhouse.query<Record<string, unknown>>(sql, { timeoutMs: 15_000 });
+  }));
+  const rows = resultSets.flatMap((result) => result.rows).slice(0, limit);
+  return {
+    query,
+    rows,
+    rowCount: rows.length,
+    searched: sources.map(({ source, columns }) => ({ source: source.sourcePath ?? source.table, fields: columns.map((column) => column.name) })),
+    note: rows.length
+      ? `Found ${rows.length} matching record${rows.length === 1 ? "" : "s"} across ${sources.length} imported file${sources.length === 1 ? "" : "s"}`
+      : `No matching values in ${sources.length} imported file${sources.length === 1 ? "" : "s"}; do not infer an entity from outside this dataset`,
+  };
+}
+
+async function executeAnalysisPlan(context: DatasetContext, plan: AnalysisPlan) {
+  const terms = plan.entityTerms.slice(0, 3);
+  if (!terms.length) return [] as SearchResult[];
+  const clickhouse = new ClickHouseClient(createClickHouseConfig());
+  const workflow = createWorkflowReporter();
+  const results = await Promise.all(terms.map((term) => workflow.activity(
+    "searching",
+    `Executing plan: resolving “${term}” across imported data`,
+    () => searchImportedTextFields(context, clickhouse, term, 10),
+    (result) => result.rowCount
+      ? `Resolved “${term}”: ${result.rowCount} matching record${result.rowCount === 1 ? "" : "s"}`
+      : `No matching values for “${term}” across ${result.searched.length} imported files`,
+  )));
+  for (const result of results) {
+    chat.response.write({
+      type: "data-entity-evidence",
+      id: `entity-evidence-${crypto.randomUUID()}`,
+      data: entityEvidence(result),
+    } as never);
+  }
+  return results;
+}
+
+function blockerInsight(question: string, plan: AnalysisPlan, results: SearchResult[]): AnalystInsight | null {
+  const unsupported = plan.requirements.filter((requirement) => !requirement.matchingColumns.length);
+  const missing = results.filter((result) => !result.rowCount);
+  if (!unsupported.length && !missing.length) return null;
+  const rows = [
+    ...unsupported.map((requirement) => ({ Check: requirement.purpose, Outcome: "No matching field in this dataset" })),
+    ...missing.map((result) => ({ Check: `Find “${result.query}”`, Outcome: "No matching values in imported text fields" })),
+  ];
+  return {
+    title: "The dataset cannot verify this request yet",
+    summary: `The plan found a specific evidence gap for: ${question}`,
+    cards: rows.slice(0, 3).map((row) => ({ label: row.Check, value: "Not verifiable", detail: row.Outcome })),
+    table: { columns: ["Check", "Outcome"], rows },
+    caveat: "The analyst stopped rather than infer an answer from outside the imported data. Import data containing the missing field or use a narrower question.",
+  };
+}
+
 function buildTools(context: DatasetContext, datasetId: string) {
   const clickhouse = new ClickHouseClient(createClickHouseConfig());
   const workflow = createWorkflowReporter();
@@ -322,25 +429,6 @@ function buildTools(context: DatasetContext, datasetId: string) {
     }, (result) => `ClickHouse returned ${result.rowCount} row${result.rowCount === 1 ? "" : "s"}`);
   };
   return {
-    plan_analysis: tool({
-      description: "Create the minimum evidence plan before any research. Use one sub-question for a simple aggregate or lookup. Use two or three only when resolving separate entities, applying a filter, or combining evidence. For example, two named people require one lookup per person and then an intersection. Never include generic steps such as 'analyze the data' or 'give the answer'.",
-      inputSchema: z.object({
-        objective: z.string().trim().min(3).max(240),
-        subquestions: z.array(z.string().trim().min(3).max(220)).min(1).max(3),
-      }),
-      execute: async (plan) => {
-        const subquestions = [...new Set(plan.subquestions.map((question) => question.trim()))].slice(0, 3);
-        const normalized = { objective: plan.objective.trim(), subquestions } satisfies AnalysisPlan;
-        workflow.status("planning", `Planned ${subquestions.length} evidence check${subquestions.length === 1 ? "" : "s"}`);
-        workflow.event("planning", `Plan ready: ${subquestions.length} focused sub-question${subquestions.length === 1 ? "" : "s"}`, "completed");
-        chat.response.write({
-          type: "data-analysis-plan",
-          id: `analysis-plan-${crypto.randomUUID()}`,
-          data: normalized,
-        } as never);
-        return normalized;
-      },
-    }),
     inspect_dataset: tool({
       description: "Return the stored schema and a small sample for one imported table. The schema for every table is already available in the system context; call this only when an unfamiliar table needs sample values.",
       inputSchema: z.object({ table: z.string().optional() }),
@@ -360,26 +448,7 @@ function buildTools(context: DatasetContext, datasetId: string) {
         let search = searchCache.get(cacheKey);
         const isNewSearch = !search;
         if (!search) {
-          const sources = context.tables.map((source) => ({ source, columns: textColumns(source) })).filter(({ columns }) => columns.length);
-          search = workflow.activity("searching", `Searching all imported text fields for “${query}”`, async () => {
-            const resultSets = await Promise.all(sources.map(async ({ source, columns }) => {
-              const predicates = terms.map((term) => `(${columns.map((column) => `positionCaseInsensitiveUTF8(toString(${quoteIdentifier(column.name)}), ${quote(term)}) > 0`).join(" OR ")})`);
-              const sql = `SELECT *, ${quote(source.sourcePath ?? source.table)} AS _source_file FROM ${source.table} WHERE ${predicates.join(" AND ")} LIMIT ${limit}`;
-              const verified = validateReadOnlySql(sql, [source.table]);
-              if (!verified.ok) throw new Error(verified.error);
-              return clickhouse.query<Record<string, unknown>>(sql, { timeoutMs: 15_000 });
-            }));
-            const rows = resultSets.flatMap((result) => result.rows).slice(0, limit);
-            return {
-              query,
-              rows,
-              rowCount: rows.length,
-              searched: sources.map(({ source, columns }) => ({ source: source.sourcePath ?? source.table, fields: columns.map((column) => column.name) })),
-              note: rows.length
-                ? `Found ${rows.length} matching record${rows.length === 1 ? "" : "s"} across ${sources.length} imported file${sources.length === 1 ? "" : "s"}`
-                : `No matching values in ${sources.length} imported file${sources.length === 1 ? "" : "s"}; do not infer an entity from outside this dataset`,
-            } satisfies SearchResult;
-          }, (result) => result.rowCount
+          search = workflow.activity("searching", `Searching all imported text fields for “${query}”`, () => searchImportedTextFields(context, clickhouse, query, limit), (result) => result.rowCount
             ? `Found ${result.rowCount} matching record${result.rowCount === 1 ? "" : "s"} across all imported files`
             : `No matching values across ${result.searched.length} imported files`);
           searchCache.set(cacheKey, search);
@@ -471,6 +540,23 @@ export const datasetChat = chat
       const context = datasetContext.get();
       const question = latestUserQuestion(messages);
       const recommendation = question ? await prepareRatingRecommendations(context, question) : null;
+      const model = resolveChatModel(clientData);
+      const planner = question && !recommendation ? createWorkflowReporter() : undefined;
+      const plan = question && planner ? await planner.activity(
+        "planning",
+        "Creating the minimum evidence plan",
+        () => createAnalysisPlan(model, question, context),
+        (value) => `Created ${value.subquestions.length} focused sub-question${value.subquestions.length === 1 ? "" : "s"}`,
+      ) : undefined;
+      if (plan) {
+        chat.response.write({
+          type: "data-analysis-plan",
+          id: `analysis-plan-${crypto.randomUUID()}`,
+          data: plan,
+        } as never);
+      }
+      const plannedEvidence = plan ? await executeAnalysisPlan(context, plan) : [];
+      const blocker = question && plan ? blockerInsight(question, plan, plannedEvidence) : null;
       if (recommendation) {
         chat.response.write({
           type: "data-analyst-insight",
@@ -478,33 +564,50 @@ export const datasetChat = chat
           data: recommendation,
         } as never);
       }
+      if (blocker) {
+        chat.response.write({
+          type: "data-analyst-insight",
+          id: "analyst-blocker",
+          data: blocker,
+        } as never);
+      }
       const streamOptions = chat.toStreamTextOptions({ tools });
-      const triggerPrepareStep = streamOptions.prepareStep as PrepareStepFunction | undefined;
+      const preflight = plan ? JSON.stringify({
+        plan: { objective: plan.objective, subquestions: plan.subquestions, requirements: plan.requirements },
+        entityEvidence: plannedEvidence.map((result) => ({ query: result.query, rowCount: result.rowCount, note: result.note, rows: result.rows.slice(0, 3) })),
+      }) : "No preflight plan was required.";
       return streamText({
         ...streamOptions,
         // Gemini is selected per session; Featherless retains its fast
         // non-reasoning default for sessions that do not opt into Gemini.
-        model: resolveChatModel(clientData),
-        system: `You are a precise, fast data analyst for arbitrary imported datasets. Answer only from ClickHouse results. Dataset tables and schemas: ${JSON.stringify(context.tables)}. For every non-trivial request, first create a short evidence plan. It must have only the necessary sub-questions: use one for a simple aggregate; add one per distinct named entity or dependent filter; never pad it. Then follow the plan: identify the relevant table and requested constraints; resolve each named person, title, or entity with its own search_records call before querying; run a bounded read-only query that applies every supported constraint; compare the result with the original question before answering, and explicitly state unsupported constraints or zero evidence. search_records searches every imported text field using substring matching. If it finds nothing, say what was searched and never infer an identity from outside knowledge. If it finds multiple candidates, state the candidates and the data-backed reason for any selection before continuing. Never repeat an identical tool call. Use rank_entities only for multi-metric rankings and select its table explicitly when necessary. Do not inspect the dataset unless a sample is necessary. Call present_insight only when a table, chart, or cards materially improve the answer. ${recommendation ? "A verified generic rating recommendation table has already been emitted. Do not call tools or emit text; the structured result is the complete answer." : "Give the direct result first and keep ordinary answers under 160 words."} Do not describe hidden reasoning. Never invent facts.`,
+        model,
+        system: `You are a precise, fast data analyst for arbitrary imported datasets. Answer only from ClickHouse results. Dataset tables and schemas: ${JSON.stringify(context.tables)}. The orchestrator has already created and executed this evidence plan: ${preflight}. Use those completed checks; do not repeat them. If a blocker is present, do not call tools or emit text because the structured blocker is the final answer. Otherwise, identify the relevant table and requested constraints; resolve any additional named entity with its own search_records call before querying; run a bounded read-only query that applies every supported constraint; compare the result with the original question before answering, and explicitly state unsupported constraints or zero evidence. search_records searches every imported text field using substring matching. If it finds nothing, say what was searched and never infer an identity from outside knowledge. If it finds multiple candidates, state the candidates and the data-backed reason for any selection before continuing. Never repeat an identical tool call. Use rank_entities only for multi-metric rankings and select its table explicitly when necessary. Do not inspect the dataset unless a sample is necessary. End every non-blocked workflow with present_insight: it is the final answer contract and must include either verified results or a precise data limitation. ${recommendation ? "A verified generic rating recommendation table has already been emitted. Do not call tools or emit text; the structured result is the complete answer." : blocker ? "A structured blocker has already been emitted. Do not call tools or emit text." : "Keep any supporting text under 120 words."} Do not describe hidden reasoning. Never invent facts.`,
         messages,
         abortSignal: signal,
         maxOutputTokens: recommendation ? 100 : 240,
         temperature: 0,
-        ...(recommendation ? {
+        ...(recommendation || blocker ? {
           toolChoice: "none" as const,
           stopWhen: stepCountIs(1),
         } : {
-          // Trigger's own prepareStep (compaction / injections) still runs;
-          // the first model step is then constrained to the visible plan.
-          prepareStep: async (options) => {
-            const triggerStep = await triggerPrepareStep?.(options);
-            if (options.stepNumber === 0) {
-              return { ...triggerStep, activeTools: ["plan_analysis"], toolChoice: { type: "tool", toolName: "plan_analysis" } };
-            }
-            return triggerStep;
-          },
-          stopWhen: stepCountIs(5),
+          stopWhen: stepCountIs(4),
         }),
+        onFinish: async (event) => {
+          const producedInsight = event.steps.some((step) => step.toolCalls.some((call) => call.toolName === "present_insight"));
+          if (!recommendation && !blocker && !event.text.trim() && !producedInsight) {
+            chat.response.write({
+              type: "data-analyst-insight",
+              id: "analyst-incomplete-workflow",
+              data: {
+                title: "The analyst did not complete a verifiable answer",
+                summary: "The workflow ended before it produced a final evidence-backed result.",
+                cards: [],
+                table: { columns: ["Status", "Next step"], rows: [{ Status: "Incomplete workflow", "Next step": "Retry the question; the visible plan and evidence are preserved for diagnosis." }] },
+                caveat: "No answer was inferred from incomplete work.",
+              } satisfies AnalystInsight,
+            } as never);
+          }
+        },
       });
     },
   });
