@@ -33,6 +33,7 @@ create table if not exists public.analysis_runs (
   dataset_import_id uuid references public.dataset_imports(id) on delete restrict,
   question text not null,
   status text not null default 'queued',
+  error_message text,
   answer jsonb,
   trigger_run_id text,
   created_at timestamptz not null default now()

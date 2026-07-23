@@ -1,7 +1,18 @@
 import { NextResponse } from "next/server";
-import { buildDemoAnswer } from "../../../../../packages/analysis/src/answer";
 import { dispatchTask } from "../../../lib/trigger";
 import { ensureWorkspace, getAuthenticatedUser, getSupabaseServerClient } from "../../../lib/supabase-server";
+
+export async function GET(request: Request) {
+  const id = new URL(request.url).searchParams.get("id");
+  if (!id) return NextResponse.json({ error: "id is required" }, { status: 400 });
+  const supabase = await getSupabaseServerClient();
+  if (!supabase) return NextResponse.json({ error: "Analysis storage is not configured" }, { status: 404 });
+  const user = await getAuthenticatedUser(supabase);
+  if (!user) return NextResponse.json({ error: "Authentication required" }, { status: 401 });
+  const { data, error } = await supabase.from("analysis_runs").select("id,status,answer,error_message,trigger_run_id,created_at").eq("id", id).single();
+  if (error) return NextResponse.json({ error: error.message }, { status: 404 });
+  return NextResponse.json(data);
+}
 
 export async function POST(request: Request) {
   const body = await request.json().catch(() => ({}));
@@ -29,5 +40,6 @@ export async function POST(request: Request) {
   if (!datasetId) datasetId = crypto.randomUUID();
   const dispatch = await dispatchTask("analyze-dataset", { analysisId, workspaceId, datasetId, question, chartPreference: body.chartPreference ?? "auto" });
   if (supabase && dispatch.runId) await supabase.from("analysis_runs").update({ trigger_run_id: dispatch.runId }).eq("id", analysisId);
-  return NextResponse.json({ status: "queued", analysisId, workspaceId, triggerRunId: dispatch.runId, live: dispatch.enabled && !dispatch.error, warning: dispatch.error ?? (dispatch.enabled ? undefined : "Trigger.dev is not configured; returning a demo answer."), answer: dispatch.enabled && !dispatch.error ? undefined : buildDemoAnswer(question) }, { status: 202 });
+  if (supabase && dispatch.error) await supabase.from("analysis_runs").update({ status: "failed", error_message: dispatch.error }).eq("id", analysisId);
+  return NextResponse.json({ status: dispatch.error ? "failed" : "queued", analysisId, workspaceId, triggerRunId: dispatch.runId, live: dispatch.enabled && !dispatch.error, warning: dispatch.error ?? (dispatch.enabled ? undefined : "Trigger.dev is not configured") }, { status: dispatch.error ? 502 : 202 });
 }

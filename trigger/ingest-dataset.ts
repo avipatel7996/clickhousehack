@@ -39,7 +39,7 @@ export const ingestDataset = task({
       },
     };
     const result = await importDataset({ workspaceId: input.workspaceId, importId: input.importId, kaggleUrl: `https://www.kaggle.com/datasets/${input.kaggleRef}`, selectedFiles: input.selectedFiles }, {
-      kaggle: new KaggleCliGateway({ executable: process.env.KAGGLE_CLI_PATH || "kaggle" }),
+      kaggle: new KaggleCliGateway({ executable: process.env.PYTHON_BIN_PATH || process.env.KAGGLE_CLI_PATH || "kaggle" }),
       objects: new S3R2ObjectStore({ endpoint: process.env.R2_ENDPOINT, bucket: process.env.R2_BUCKET, accessKeyId: process.env.R2_ACCESS_KEY_ID, secretAccessKey: process.env.R2_SECRET_ACCESS_KEY }),
       clickhouse: new ClickHousePublisher({ config: clickHouseConfigFromEnv(), table: `dataset_${input.importId.replace(/-/g, "_")}` }),
       repository,

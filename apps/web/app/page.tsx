@@ -26,7 +26,27 @@ export default function HomePage() {
     setMessages((items) => [...items, { role: "user", text: current }]);
     const response = await fetch("/api/analyses", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ question: current }) });
     const body = await response.json();
-    setMessages((items) => [...items, { role: "assistant", text: body.answer ?? body.message ?? body.error ?? "Analysis queued." }]);
+    if (!response.ok || body.status === "failed") {
+      setMessages((items) => [...items, { role: "assistant", text: body.warning ?? body.error ?? "Analysis could not be queued." }]);
+      return;
+    }
+    setMessages((items) => [...items, { role: "assistant", text: "Analysis queued; waiting for the ClickHouse-backed result…" }]);
+    for (let attempt = 0; attempt < 30; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      const poll = await fetch(`/api/analyses?id=${encodeURIComponent(body.analysisId)}`);
+      if (!poll.ok) continue;
+      const result = await poll.json();
+      if (result.status === "completed") {
+        const answer = result.answer?.answer ?? result.answer?.result?.answer ?? "Analysis completed.";
+        setMessages((items) => [...items, { role: "assistant", text: String(answer) }]);
+        return;
+      }
+      if (result.status === "failed") {
+        setMessages((items) => [...items, { role: "assistant", text: result.error_message ?? "Analysis failed; inspect the Trigger run logs." }]);
+        return;
+      }
+    }
+    setMessages((items) => [...items, { role: "assistant", text: "Analysis is still running. Open Trigger Runs for live logs." }]);
   }
 
   return <main style={{ maxWidth: 920, margin: "0 auto", padding: "48px 24px", fontFamily: "system-ui" }}>
