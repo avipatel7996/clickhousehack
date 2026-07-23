@@ -44,20 +44,65 @@ async function resolveDataset(datasetId: string): Promise<DatasetContext> {
 
 function quote(value: string) { return `'${value.replace(/'/g, "''")}'`; }
 
+type AgentStage = "planning" | "inspecting" | "searching" | "querying" | "ranking" | "answering" | "error";
+type AgentEvent = { at: string; stage: AgentStage; message: string; state: "started" | "completed" | "failed" };
+
+function writeAgentStatus(stage: AgentStage, message: string) {
+  chat.response.write({
+    type: "data-agent-status",
+    id: "agent-status",
+    data: { stage, message, at: new Date().toISOString() },
+    transient: true,
+  } as never);
+}
+
+function createWorkflowReporter() {
+  let nextEvent = 0;
+  const event = (stage: AgentStage, message: string, state: AgentEvent["state"]) => {
+    chat.response.write({
+      type: "data-agent-event",
+      id: `agent-event-${nextEvent++}`,
+      data: { stage, message, state, at: new Date().toISOString() } satisfies AgentEvent,
+    } as never);
+  };
+  return {
+    status: writeAgentStatus,
+    event,
+    async activity<T>(stage: AgentStage, message: string, work: () => Promise<T>, completed: (result: T) => string) {
+      writeAgentStatus(stage, message);
+      event(stage, message, "started");
+      try {
+        const result = await work();
+        const completion = completed(result);
+        event(stage, completion, "completed");
+        writeAgentStatus("answering", "Interpreting the verified result");
+        return result;
+      } catch (error) {
+        event(stage, `${message} did not complete`, "failed");
+        writeAgentStatus("error", "A data step failed; the analyst is stopping safely");
+        throw error;
+      }
+    },
+  };
+}
+
 function buildTools(context: DatasetContext, datasetId: string) {
   const clickhouse = new ClickHouseClient(createClickHouseConfig());
-  const runQuery = async (sql: string) => {
-    const verified = validateReadOnlySql(sql, [context.table]);
-    if (!verified.ok) throw new Error(verified.error);
-    const result = await clickhouse.query<Record<string, unknown>>(sql, { timeoutMs: 15_000 });
-    return { sql, rows: result.rows.slice(0, 20), rowCount: result.rows.length, table: context.table };
+  const workflow = createWorkflowReporter();
+  const runQuery = async (stage: Extract<AgentStage, "inspecting" | "searching" | "querying" | "ranking">, message: string, sql: string) => {
+    return workflow.activity(stage, message, async () => {
+      const verified = validateReadOnlySql(sql, [context.table]);
+      if (!verified.ok) throw new Error(verified.error);
+      const result = await clickhouse.query<Record<string, unknown>>(sql, { timeoutMs: 15_000 });
+      return { sql, rows: result.rows.slice(0, 20), rowCount: result.rows.length, table: context.table };
+    }, (result) => `ClickHouse returned ${result.rowCount} row${result.rowCount === 1 ? "" : "s"}`);
   };
   return {
     inspect_dataset: tool({
       description: "Return the dataset schema, table name, and a small sample. Call this before answering an unfamiliar question.",
       inputSchema: z.object({}),
       execute: async () => {
-        const sample = await runQuery(`SELECT * FROM ${context.table} LIMIT 3`);
+        const sample = await runQuery("inspecting", "Reading a small dataset sample", `SELECT * FROM ${context.table} LIMIT 3`);
         return { datasetId, version: context.version, table: context.table, columns: context.columns, sample: sample.rows };
       },
     }),
@@ -69,13 +114,13 @@ function buildTools(context: DatasetContext, datasetId: string) {
         const terms = query.toLowerCase().split(/\s+/).filter((term) => term.length > 1).slice(0, 6);
         const predicates = terms.flatMap((term) => searchable.map((column) => `positionCaseInsensitiveUTF8(toString(\`${column.replace(/`/g, "")}\`), ${quote(term)}) > 0`));
         if (!predicates.length) return { query, rows: [], note: "No searchable terms supplied" };
-        return runQuery(`SELECT * FROM ${context.table} WHERE ${predicates.join(" OR ")} LIMIT ${limit}`);
+        return runQuery("searching", `Searching matching records for “${query}”`, `SELECT * FROM ${context.table} WHERE ${predicates.join(" OR ")} LIMIT ${limit}`);
       },
     }),
     query_clickhouse: tool({
       description: "Run one read-only ClickHouse SELECT query. Always use the exact table name and columns returned by inspect_dataset. Prefer LIMIT 50 or less unless aggregating.",
       inputSchema: z.object({ sql: z.string().min(8).max(5000) }),
-      execute: async ({ sql }) => runQuery(sql),
+      execute: async ({ sql }) => runQuery("querying", "Running a read-only ClickHouse query", sql),
     }),
     rank_entities: tool({
       description: "Rank entities such as players or movies using multiple numeric columns. Use this for top/best/strongest questions instead of ordering by one arbitrary metric. The score normalizes each selected metric to 0..1 before averaging.",
@@ -88,7 +133,7 @@ function buildTools(context: DatasetContext, datasetId: string) {
         const components = metricColumns.map((column, index) => `ifNull((toFloat64OrNull(${quoteIdentifier(column)}) - min_${index}) / nullIf(max_${index} - min_${index}, 0), 0)`).join(" + ");
         const selected = metricColumns.map((column) => quoteIdentifier(column)).join(", ");
         const sql = `WITH bounds AS (SELECT ${bounds} FROM ${context.table}), scored AS (SELECT ${quoteIdentifier(entityColumn)} AS entity, (${components}) / ${metricColumns.length} AS composite_score, ${selected} FROM ${context.table} CROSS JOIN bounds) SELECT * FROM scored WHERE entity IS NOT NULL ORDER BY composite_score DESC LIMIT ${limit}`;
-        return runQuery(sql);
+        return runQuery("ranking", `Ranking ${entityColumn} using ${metricColumns.length} metrics`, sql);
       },
     }),
     present_insight: tool({
@@ -101,7 +146,11 @@ function buildTools(context: DatasetContext, datasetId: string) {
         chart: z.object({ type: z.enum(["bar", "line", "none"]), x: z.string().optional(), y: z.string().optional(), data: z.array(z.record(z.string(), z.union([z.string(), z.number(), z.null()]))).max(20).default([]) }).optional(),
         caveat: z.string().max(500).optional(),
       }),
-      execute: async (insight) => insight,
+      execute: async (insight) => {
+        workflow.event("answering", "Prepared the evidence-backed answer", "completed");
+        workflow.status("answering", "Streaming the answer");
+        return insight;
+      },
     }),
   };
 }
@@ -114,13 +163,22 @@ export const datasetChat = chat
     machine: "small-1x",
     maxDuration: 90,
     idleTimeoutInSeconds: 60,
+    uiMessageStreamOptions: {
+      sendReasoning: false,
+      onError: () => "The analyst could not complete this request. Please try again.",
+    },
     onBoot: async ({ clientData }) => {
       if (!clientData) throw new Error("Dataset context is required");
       datasetContext.init(await resolveDataset(clientData.datasetId));
     },
     tools: async () => buildTools(datasetContext.get(), datasetContext.datasetId),
-    onTurnStart: async () => {
-      chat.response.write({ type: "data-agent-status", data: { stage: "planning" } } as never);
+    onTurnStart: async ({ writer }) => {
+      writer.write({
+        type: "data-agent-status",
+        id: "agent-status",
+        data: { stage: "planning", message: "Understanding your question", at: new Date().toISOString() },
+        transient: true,
+      } as never);
     },
     run: async ({ messages, tools, clientData, signal }) => {
       if (!clientData) throw new Error("Dataset context is required");
