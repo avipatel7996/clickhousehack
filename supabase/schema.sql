@@ -38,6 +38,7 @@ create table if not exists public.analysis_runs (
   trigger_run_id text,
   created_at timestamptz not null default now()
 );
+alter table public.analysis_runs add column if not exists error_message text;
 
 alter table public.workspaces enable row level security;
 alter table public.workspace_members enable row level security;
