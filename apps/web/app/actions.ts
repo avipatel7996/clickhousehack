@@ -6,8 +6,11 @@ import { ensureWorkspace, getAuthenticatedUser, getSupabaseServerClient } from "
 
 const startSession = chat.createStartSessionAction("dataset-chat");
 
+type GeminiClientSettings = { apiKey?: string; baseURL?: string; model?: string };
+type DatasetChatClientData = { datasetId: string; provider?: "featherless" | "gemini"; gemini?: GeminiClientSettings };
+
 /** Authorizes a browser session against the selected workspace before minting a session token. */
-export async function startDatasetChat(params: { chatId: string; clientData: { datasetId: string } }) {
+export async function startDatasetChat(params: { chatId: string; clientData: DatasetChatClientData }) {
   const supabase = await getSupabaseServerClient();
   if (!supabase) throw new Error("Authentication is required");
   const user = await getAuthenticatedUser(supabase);
@@ -16,7 +19,10 @@ export async function startDatasetChat(params: { chatId: string; clientData: { d
   if (!workspaceId) throw new Error("Workspace membership is required");
   const { data, error } = await supabase.from("dataset_imports").select("id,status").eq("id", params.clientData.datasetId).eq("workspace_id", workspaceId).maybeSingle();
   if (error || !data || data.status !== "published") throw new Error("Select a published dataset before starting chat");
-  return startSession({ chatId: params.chatId, clientData: { datasetId: data.id } });
+  const provider = params.clientData.provider ?? "featherless";
+  return startSession({ chatId: params.chatId, clientData: provider === "gemini"
+    ? { datasetId: data.id, provider, gemini: params.clientData.gemini }
+    : { datasetId: data.id, provider } });
 }
 
 export async function mintDatasetChatToken(chatId: string) {

@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 import { useChat } from "@ai-sdk/react";
 import { useTriggerChatTransport } from "@trigger.dev/sdk/chat/react";
 import { mintDatasetChatToken, startDatasetChat } from "./actions";
@@ -17,6 +17,15 @@ type Insight = {
 type AgentStatus = { stage: string; message: string; at: string };
 type AgentEvent = { stage: string; message: string; state: "started" | "completed" | "failed"; at: string };
 type ChatActivity = Pick<AgentStatus, "stage" | "message">;
+type GeminiSettings = { apiKey?: string; baseURL?: string; model?: string };
+type ChatProvider = { kind: "featherless" } | { kind: "gemini"; settings: GeminiSettings };
+
+const providerStorageKey = "clickhouse-analyst.gemini-settings";
+const defaultGeminiSettings: GeminiSettings = {
+  apiKey: "",
+  baseURL: "https://generativelanguage.googleapis.com/v1beta",
+  model: "gemini-flash-latest",
+};
 
 function formatTime(value: string) {
   const date = new Date(value);
@@ -75,16 +84,18 @@ function WorkflowTrace({ parts, activity }: { parts: any[]; activity: ChatActivi
   </aside>;
 }
 
-export function DatasetAgentChat({ datasetId, datasetName }: { datasetId: string; datasetName: string }) {
+function DatasetChatSession({ datasetId, provider }: { datasetId: string; provider: ChatProvider }) {
   const [chatId] = useState(() => crypto.randomUUID());
   const [input, setInput] = useState("");
   const [transportError, setTransportError] = useState<string | null>(null);
   const [activity, setActivity] = useState<ChatActivity | null>(null);
   const transport = useTriggerChatTransport({
     task: "dataset-chat",
-    clientData: { datasetId },
+    clientData: provider.kind === "gemini"
+      ? { datasetId, provider: "gemini" as const, gemini: provider.settings }
+      : { datasetId, provider: "featherless" as const },
     accessToken: ({ chatId }) => mintDatasetChatToken(chatId),
-    startSession: ({ chatId, clientData }) => startDatasetChat({ chatId, clientData: clientData as { datasetId: string } }),
+    startSession: ({ chatId, clientData }) => startDatasetChat({ chatId, clientData: clientData as { datasetId: string; provider?: "featherless" | "gemini"; gemini?: GeminiSettings } }),
     onEvent: (event) => {
       if (event.type === "message-sent") setActivity({ stage: "planning", message: "Question received — preparing the analyst" });
       if (event.type === "stream-connected") setActivity({ stage: "planning", message: "Analyst is checking the dataset" });
@@ -107,9 +118,7 @@ export function DatasetAgentChat({ datasetId, datasetName }: { datasetId: string
     sendMessage({ text: input.trim() });
     setInput("");
   };
-  return <section style={{ marginTop: 24, padding: 24, border: "1px solid #e2e8f0", borderRadius: 12 }}>
-    <h2 style={{ marginTop: 0 }}>Ask {datasetName}</h2>
-    <p style={{ color: "#64748b" }}>The agent searches name variations, queries ClickHouse, and returns evidence-backed UI.</p>
+  return <>
     <div>{activity && !latestAssistantId && <WorkflowTrace parts={[]} activity={activity} />}{messages.map((message: any) => {
       const isLiveAssistant = Boolean(activity) && message.role === "assistant" && message.id === latestAssistantId;
       return <div key={message.id} style={{ margin: "16px 0" }}><strong>{message.role === "user" ? "You" : "Analyst"}</strong>{message.role === "assistant" && <WorkflowTrace parts={message.parts ?? []} activity={isLiveAssistant ? activity : null} />}{message.parts?.map((part: any, index: number) => {
@@ -121,5 +130,61 @@ export function DatasetAgentChat({ datasetId, datasetName }: { datasetId: string
     })}</div>
     {(error || transportError) && <p role="alert" style={{ marginTop: 12, color: "#b91c1c" }}>{error?.message ?? transportError}</p>}
     <form onSubmit={submit} style={{ display: "flex", gap: 12, marginTop: 16 }}><input value={input} onChange={(event) => setInput(event.target.value)} placeholder="e.g. Which Nolan movie features Leonardo DiCaprio?" style={{ flex: 1, padding: 12 }} /><button disabled={busy}>{status === "submitted" ? "Connecting…" : status === "streaming" ? "Analysing…" : "Ask"}</button>{busy && <button type="button" onClick={() => { setActivity({ stage: "planning", message: "Stopping the analyst" }); stop(); }}>Stop</button>}</form>
+  </>;
+}
+
+export function DatasetAgentChat({ datasetId, datasetName }: { datasetId: string; datasetName: string }) {
+  const [selectedKind, setSelectedKind] = useState<ChatProvider["kind"]>("featherless");
+  const [geminiSettings, setGeminiSettings] = useState<GeminiSettings>(defaultGeminiSettings);
+  const [activeProvider, setActiveProvider] = useState<ChatProvider>({ kind: "featherless" });
+  const [sessionKey, setSessionKey] = useState(0);
+  const [settingsMessage, setSettingsMessage] = useState("");
+
+  useEffect(() => {
+    try {
+      const saved = JSON.parse(window.localStorage.getItem(providerStorageKey) ?? "") as { kind?: ChatProvider["kind"]; settings?: GeminiSettings };
+      if (saved.kind === "gemini") {
+        setSelectedKind("gemini");
+        const settings = saved.settings ?? defaultGeminiSettings;
+        setGeminiSettings(settings);
+        setActiveProvider({ kind: "gemini", settings });
+      }
+    } catch {
+      // A malformed local preference should never prevent the chat from loading.
+    }
+  }, []);
+
+  const startNewChat = () => {
+    if (selectedKind === "gemini") {
+      const settings = { apiKey: geminiSettings.apiKey?.trim(), baseURL: geminiSettings.baseURL?.trim(), model: geminiSettings.model?.trim() };
+      if (!settings.baseURL || !settings.model) {
+        setSettingsMessage("Enter the Gemini API base URL and model first.");
+        return;
+      }
+      window.localStorage.setItem(providerStorageKey, JSON.stringify({ kind: "gemini", settings }));
+      setGeminiSettings(settings);
+      setActiveProvider({ kind: "gemini", settings });
+      setSettingsMessage("Gemini settings saved on this device. New chat ready.");
+    } else {
+      window.localStorage.setItem(providerStorageKey, JSON.stringify({ kind: "featherless", settings: geminiSettings }));
+      setActiveProvider({ kind: "featherless" });
+      setSettingsMessage("Featherless selected. New chat ready.");
+    }
+    setSessionKey((value) => value + 1);
+  };
+
+  return <section style={{ marginTop: 24, padding: 24, border: "1px solid #e2e8f0", borderRadius: 12 }}>
+    <h2 style={{ marginTop: 0 }}>Ask {datasetName}</h2>
+    <p style={{ color: "#64748b" }}>The agent queries ClickHouse, then streams an evidence-backed answer.</p>
+    <details style={{ margin: "14px 0", padding: "10px 12px", border: "1px solid #e2e8f0", borderRadius: 8, background: "#f8fafc" }}>
+      <summary style={{ cursor: "pointer", fontWeight: 600 }}>Model connection · {activeProvider.kind === "gemini" ? `Gemini (${activeProvider.settings.model})` : "Featherless"}</summary>
+      <div style={{ display: "grid", gap: 10, marginTop: 12 }}>
+        <label>Provider <select value={selectedKind} onChange={(event) => setSelectedKind(event.target.value as ChatProvider["kind"])} style={{ marginLeft: 8, padding: 8 }}><option value="featherless">Featherless</option><option value="gemini">Gemini API</option></select></label>
+        {selectedKind === "gemini" && <><label>Gemini API base URL <input value={geminiSettings.baseURL ?? ""} onChange={(event) => setGeminiSettings((value) => ({ ...value, baseURL: event.target.value }))} style={{ display: "block", width: "100%", boxSizing: "border-box", marginTop: 4, padding: 8 }} /></label><label>Gemini API key override (optional when `GEMINI_API_KEY` is set in Trigger) <input type="password" autoComplete="off" value={geminiSettings.apiKey ?? ""} onChange={(event) => setGeminiSettings((value) => ({ ...value, apiKey: event.target.value }))} placeholder="Paste a rotated Gemini key" style={{ display: "block", width: "100%", boxSizing: "border-box", marginTop: 4, padding: 8 }} /></label><label>Model <input value={geminiSettings.model ?? ""} onChange={(event) => setGeminiSettings((value) => ({ ...value, model: event.target.value }))} style={{ display: "block", width: "100%", boxSizing: "border-box", marginTop: 4, padding: 8 }} /></label></>}
+        <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}><button type="button" onClick={startNewChat}>{selectedKind === "gemini" ? "Save Gemini settings & start new chat" : "Start new Featherless chat"}</button>{settingsMessage && <small style={{ color: "#475569" }}>{settingsMessage}</small>}</div>
+        <small style={{ color: "#64748b" }}>Prefer `GEMINI_API_KEY` in Trigger for the shared key. A browser key is an optional override and is never committed. Start a new chat after changing provider settings.</small>
+      </div>
+    </details>
+    <DatasetChatSession key={sessionKey} datasetId={datasetId} provider={activeProvider} />
   </section>;
 }

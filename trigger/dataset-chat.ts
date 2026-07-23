@@ -1,5 +1,6 @@
 import { chat } from "@trigger.dev/sdk/ai";
 import { createOpenAI } from "@ai-sdk/openai";
+import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { stepCountIs, streamText, tool } from "ai";
 import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
@@ -7,7 +8,15 @@ import { ClickHouseClient, createClickHouseConfig, validateReadOnlySql } from ".
 
 const clientDataSchema = z.object({
   datasetId: z.string().uuid(),
+  provider: z.enum(["featherless", "gemini"]).default("featherless"),
+  gemini: z.object({
+    apiKey: z.string().trim().max(512).optional(),
+    baseURL: z.string().trim().url().max(500).optional(),
+    model: z.string().trim().max(160).optional(),
+  }).optional(),
 });
+
+type ChatClientData = z.infer<typeof clientDataSchema>;
 
 type DatasetContext = {
   datasetId: string;
@@ -23,6 +32,21 @@ function serviceSupabase() {
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!url || !key) throw new Error("Supabase service credentials are required for the data agent");
   return createClient(url, key);
+}
+
+function resolveChatModel(clientData: ChatClientData) {
+  if (clientData.provider === "gemini") {
+    const config = clientData.gemini;
+    const apiKey = config?.apiKey || process.env.GEMINI_API_KEY;
+    if (!apiKey) throw new Error("Set GEMINI_API_KEY in Trigger.dev or enter a Gemini API key in the chat settings");
+    const baseURL = config?.baseURL || process.env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com/v1beta";
+    const model = config?.model || process.env.GEMINI_MODEL || "gemini-flash-latest";
+    return createGoogleGenerativeAI({ apiKey, baseURL })(model);
+  }
+  const apiKey = process.env.FEATHERLESS_API_KEY;
+  if (!apiKey) throw new Error("FEATHERLESS_API_KEY is required");
+  const provider = createOpenAI({ apiKey, baseURL: process.env.FEATHERLESS_BASE_URL ?? "https://api.featherless.ai/v1" });
+  return provider.chat(process.env.FEATHERLESS_INTERACTIVE_MODEL ?? "Qwen/Qwen2.5-7B-Instruct");
 }
 
 async function resolveDataset(datasetId: string): Promise<DatasetContext> {
@@ -190,15 +214,11 @@ export const datasetChat = chat
     run: async ({ messages, tools, clientData, signal }) => {
       if (!clientData) throw new Error("Dataset context is required");
       const context = datasetContext.get();
-      const apiKey = process.env.FEATHERLESS_API_KEY;
-      if (!apiKey) throw new Error("FEATHERLESS_API_KEY is required");
-      const provider = createOpenAI({ apiKey, baseURL: process.env.FEATHERLESS_BASE_URL ?? "https://api.featherless.ai/v1" });
       return streamText({
         ...chat.toStreamTextOptions({ tools }),
-        // Qwen3 enables a hidden reasoning pass by default. For an interactive
-        // query tool this smaller, non-reasoning instruct model gets the first
-        // visible token to the browser much sooner while retaining tool calls.
-        model: provider.chat(process.env.FEATHERLESS_INTERACTIVE_MODEL ?? "Qwen/Qwen2.5-7B-Instruct"),
+        // Gemini is selected per session; Featherless retains its fast
+        // non-reasoning default for sessions that do not opt into Gemini.
+        model: resolveChatModel(clientData),
         system: `You are a precise, fast data analyst. Answer only from ClickHouse results. Dataset table: ${context.table}. Columns: ${JSON.stringify(context.columns)}. The schema is already available, so for a straightforward question call query_clickhouse directly with one bounded query, then answer from its result. Use search_records only for names, titles, or fuzzy text lookup; use rank_entities only for multi-metric rankings. Do not inspect the dataset unless the user explicitly asks for a sample or schema. Call present_insight only when a table, chart, or cards materially improve the answer. Give the direct result first and keep ordinary answers under 160 words. Do not describe hidden reasoning. Never invent facts.`,
         messages,
         abortSignal: signal,

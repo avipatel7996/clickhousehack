@@ -15,6 +15,7 @@
     "packages/*"
   ],
   "dependencies": {
+    "@ai-sdk/google": "^3.0.99",
     "@ai-sdk/openai": "^3.0.87",
     "@ai-sdk/react": "^3.0.236",
     "@aws-sdk/client-s3": "^3.850.0",
