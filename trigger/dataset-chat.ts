@@ -107,10 +107,11 @@ function writeAgentStatus(stage: AgentStage, message: string) {
 
 function createWorkflowReporter() {
   let nextEvent = 0;
+  const eventScope = crypto.randomUUID();
   const event = (stage: AgentStage, message: string, state: AgentEvent["state"]) => {
     chat.response.write({
       type: "data-agent-event",
-      id: `agent-event-${nextEvent++}`,
+      id: `agent-event-${eventScope}-${nextEvent++}`,
       data: { stage, message, state, at: new Date().toISOString() } satisfies AgentEvent,
     } as never);
   };
@@ -140,7 +141,7 @@ type AnalystInsight = {
   summary: string;
   cards: Array<{ label: string; value: string; detail?: string }>;
   table: { columns: string[]; rows: Array<Record<string, string | number | boolean | null>> };
-  chart: { type: "bar"; x: string; y: string; data: Array<Record<string, string | number | null>> };
+  chart?: { type: "bar"; x: string; y: string; data: Array<Record<string, string | number | null>> };
   caveat: string;
 };
 
@@ -167,9 +168,20 @@ function latestUserQuestion(messages: unknown[]): string | undefined {
   return undefined;
 }
 
-function isMovieRecommendationQuestion(question: string) {
+function normalizeTerm(term: string) {
+  return term.length > 3 && term.endsWith("s") ? term.slice(0, -1) : term;
+}
+
+function isUnfilteredRatingRecommendation(question: string, context: DatasetContext) {
   const text = question.toLowerCase();
-  return /\b(movie|movies|film|films)\b/.test(text) && /\b(suggest|recommend|good|best|top|rating|rated|watch)\b/.test(text);
+  const asksForRecommendation = /\b(suggest|recommend|good|best|top|highest|highly rated|watch)\b/.test(text);
+  const hasSpecificFilter = /\b(by|with|near|from|in|after|before|between|under|over|above|for)\b/.test(text) || /\b\d{4}\b/.test(text);
+  const genericWords = new Set(["a", "an", "and", "are", "based", "best", "can", "do", "for", "give", "good", "highest", "highly", "i", "me", "on", "please", "rated", "rating", "ratings", "recommend", "recommendation", "recommendations", "recommended", "should", "show", "some", "suggest", "suggestion", "suggestions", "the", "to", "top", "us", "watch", "what", "which", "you"]);
+  const datasetTerms = new Set(context.tables.flatMap((source) => [source.table, source.sourcePath ?? "", ...source.columns.map((column) => column.name)]).flatMap((value) => value.toLowerCase().match(/[a-z0-9]+/g) ?? []).map(normalizeTerm));
+  const topicWords = (text.match(/[a-z0-9]+/g) ?? []).filter((word) => !genericWords.has(word));
+  // Keep the fast path narrow: unknown topic words (a person, location, genre,
+  // or arbitrary filter) must go through the general evidence workflow first.
+  return asksForRecommendation && !hasSpecificFilter && topicWords.length > 0 && topicWords.every((word) => datasetTerms.has(normalizeTerm(word)));
 }
 
 function firstColumn(columns: DatasetColumn[], names: string[]) {
@@ -181,44 +193,52 @@ function firstColumn(columns: DatasetColumn[], names: string[]) {
   return undefined;
 }
 
-type MovieRecommendationSource = {
+function entityColumn(columns: DatasetColumn[]) {
+  return firstColumn(columns, ["title", "name", "label", "product_name", "item_name", "restaurant_name", "company_name", "artist_name", "player_name", "original_title"])
+    ?? columns.find((column) => /(^|_)(name|title|label)$/i.test(column.name))?.name;
+}
+
+type RatingRecommendationSource = {
   source: DatasetTable;
-  title: string;
+  entity: string;
   rating: string;
   votes: string | undefined;
   release: string | undefined;
   score: number;
 };
 
-async function prepareMovieRecommendations(context: DatasetContext, question: string): Promise<AnalystInsight | null> {
-  if (!isMovieRecommendationQuestion(question)) return null;
+function humanizeColumn(name: string) {
+  return name.replace(/[_-]+/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+async function prepareRatingRecommendations(context: DatasetContext, question: string): Promise<AnalystInsight | null> {
+  if (!isUnfilteredRatingRecommendation(question, context)) return null;
   const candidates = context.tables.map((source) => {
-    const title = firstColumn(source.columns, ["title", "movie_title", "name", "original_title"]);
+    const entity = entityColumn(source.columns);
     const rating = firstColumn(source.columns, ["vote_average", "rating", "imdb_rating", "score"]);
     const votes = firstColumn(source.columns, ["vote_count", "votes", "rating_count", "review_count"]);
-    const release = firstColumn(source.columns, ["release_date", "release_year", "year"]);
-    return { source, title, rating, votes, release, score: Number(Boolean(title)) + Number(Boolean(rating)) * 4 + Number(Boolean(votes)) * 2 + Number(rating === "vote_average") * 2 };
-  }).filter((candidate): candidate is MovieRecommendationSource => Boolean(candidate.title && candidate.rating));
+    const release = firstColumn(source.columns, ["release_date", "release_year", "year", "date"]);
+    return { source, entity, rating, votes, release, score: Number(Boolean(entity)) + Number(Boolean(rating)) * 4 + Number(Boolean(votes)) * 2 + Number(rating === "vote_average") * 2 };
+  }).filter((candidate): candidate is RatingRecommendationSource => Boolean(candidate.entity && candidate.rating));
   const target = candidates.sort((left, right) => right.score - left.score)[0];
   if (!target) return null;
 
   const workflow = createWorkflowReporter();
-  workflow.status("planning", "Planning a four-step movie recommendation workflow");
-  workflow.event("planning", "1/4 Identified a rating-based movie recommendation", "completed");
-  const source = await workflow.activity("inspecting", "2/4 Mapping title, rating, and review columns", async () => target, (value) => `Mapped ${value.title}, ${value.rating}${value.votes ? `, and ${value.votes}` : ""}`);
+  workflow.status("planning", "Planning a four-step rating-based recommendation workflow");
+  workflow.event("planning", "1/4 Identified an unfiltered rating recommendation", "completed");
+  const source = await workflow.activity("inspecting", "2/4 Mapping entity, rating, and review columns", async () => target, (value) => `Mapped ${value.entity}, ${value.rating}${value.votes ? `, and ${value.votes}` : ""}`);
   const clickhouse = new ClickHouseClient(createClickHouseConfig());
-  const title = quoteIdentifier(source.title);
+  const entity = quoteIdentifier(source.entity);
   const rating = quoteIdentifier(source.rating);
   const votes = source.votes ? quoteIdentifier(source.votes) : undefined;
   const release = source.release ? quoteIdentifier(source.release) : undefined;
   const ratingValue = floatOrNull(rating);
   const voteValue = votes ? intOrNull(votes) : undefined;
-  const voteSelect = voteValue ? `, max(${voteValue}) AS movie_votes` : "";
-  const yearSelect = release ? `, max(toYear(${release})) AS release_year` : "";
-  const voteFilter = voteValue ? ` HAVING max(${voteValue}) >= 500` : "";
-  const voteOrder = votes ? ", movie_votes DESC" : "";
-  const sql = `SELECT ${title} AS movie_title, max(${ratingValue}) AS movie_rating${voteSelect}${yearSelect} FROM ${source.source.table} WHERE ${title} IS NOT NULL AND ${ratingValue} >= 7.5 GROUP BY ${title}${voteFilter} ORDER BY movie_rating DESC${voteOrder} LIMIT 8`;
-  const result = await workflow.activity("querying", "3/4 Querying high-rated movies with enough reviews", async () => {
+  const voteSelect = voteValue ? `, max(${voteValue}) AS review_count` : "";
+  const yearSelect = release ? `, max(toYear(parseDateTimeBestEffortOrNull(toString(${release})))) AS release_year` : "";
+  const voteOrder = voteValue ? ", review_count DESC" : "";
+  const sql = `SELECT ${entity} AS entity_name, max(${ratingValue}) AS entity_rating${voteSelect}${yearSelect} FROM ${source.source.table} WHERE ${entity} IS NOT NULL AND ${ratingValue} IS NOT NULL GROUP BY ${entity} ORDER BY entity_rating DESC${voteOrder} LIMIT 8`;
+  const result = await workflow.activity("querying", "3/4 Ranking records by their dataset rating", async () => {
     const verified = validateReadOnlySql(sql, context.tables.map((table) => table.table));
     if (!verified.ok) throw new Error(verified.error);
     return clickhouse.query<Record<string, unknown>>(sql, { timeoutMs: 15_000 });
@@ -226,21 +246,55 @@ async function prepareMovieRecommendations(context: DatasetContext, question: st
   if (!result.rows.length) return null;
   const number = (value: unknown) => Number.isFinite(Number(value)) ? Number(value) : 0;
   const rows = result.rows.map((row) => ({
-    title: String(row.movie_title ?? "Untitled"),
-    rating: number(row.movie_rating),
-    votes: number(row.movie_votes),
+    entity: String(row.entity_name ?? "Untitled"),
+    rating: number(row.entity_rating),
+    reviews: number(row.review_count),
     year: number(row.release_year) || null,
   }));
+  const entityLabel = humanizeColumn(source.entity);
   workflow.event("answering", "4/4 Rendered an evidence-backed recommendation list", "completed");
-  workflow.status("answering", "Streaming your movie recommendations");
+  workflow.status("answering", "Streaming your recommendations");
   return {
-    title: "Highly rated movies to try",
-    summary: `These are ranked by dataset rating${votes ? " with at least 500 votes" : ""}, so one-off ratings do not dominate the list.`,
-    cards: rows.slice(0, 3).map((row) => ({ label: row.title, value: `${row.rating.toFixed(1)} / 10`, detail: row.votes ? `${row.votes.toLocaleString()} votes${row.year ? ` · ${row.year}` : ""}` : row.year ? String(row.year) : undefined })),
-    table: { columns: ["Movie", "Rating", "Votes", "Year"], rows: rows.map((row) => ({ Movie: row.title, Rating: row.rating.toFixed(1), Votes: row.votes ? row.votes.toLocaleString() : "—", Year: row.year ?? "—" })) },
-    chart: { type: "bar", x: "title", y: "rating", data: rows.map((row) => ({ title: row.title, rating: row.rating })) },
-    caveat: `Source: ${source.source.sourcePath ?? source.source.table}. Ask for a genre, year, or language to narrow this further.`,
+    title: "Highly rated recommendations",
+    summary: `These are ranked by the dataset's ${humanizeColumn(source.rating)}${voteValue ? "; review count breaks rating ties and is shown for context" : ""}.`,
+    cards: rows.slice(0, 3).map((row) => ({ label: row.entity, value: String(Number(row.rating.toFixed(2))), detail: row.reviews ? `${row.reviews.toLocaleString()} reviews${row.year ? ` · ${row.year}` : ""}` : row.year ? String(row.year) : undefined })),
+    table: { columns: [entityLabel, "Rating", "Reviews", "Year"], rows: rows.map((row) => ({ [entityLabel]: row.entity, Rating: String(Number(row.rating.toFixed(2))), Reviews: row.reviews ? row.reviews.toLocaleString() : "—", Year: row.year ?? "—" })) },
+    caveat: `Source: ${source.source.sourcePath ?? source.source.table}. Ask for a specific filter to narrow this further.`,
   };
+}
+
+type SearchResult = {
+  query: string;
+  rows: Array<Record<string, unknown>>;
+  rowCount: number;
+  searched: Array<{ source: string; fields: string[] }>;
+  note: string;
+};
+
+function entityEvidence(result: SearchResult) {
+  const needle = result.query.toLowerCase();
+  const candidates = result.rows.slice(0, 5).map((row, index) => {
+    const matched = Object.entries(row)
+      .filter(([key, value]) => !key.startsWith("_") && String(value ?? "").toLowerCase().includes(needle))
+      .slice(0, 2)
+      .map(([field, value]) => ({ field, value: String(value).slice(0, 220) }));
+    const label = [row.title, row.name, row.original_title].find((value) => typeof value === "string" && value.trim()) ?? `Match ${index + 1}`;
+    return { label: String(label), source: String(row._source_file ?? "Imported dataset"), matched };
+  });
+  return {
+    query: result.query,
+    candidates,
+    searched: result.searched.map(({ source, fields }) => ({ source, fields })),
+    conclusion: result.rowCount
+      ? result.rowCount === 1
+        ? "One matching record was found. Its fields—not outside knowledge—are the evidence for any next step."
+        : `${result.rowCount} matching records were found. A text match alone does not establish a person’s role; use the matching fields to disambiguate.`
+      : "No matching record was found in the imported data. The analyst will not infer an identity from outside knowledge.",
+  };
+}
+
+function textColumns(source: DatasetTable) {
+  return source.columns.filter((column) => /string|fixedstring|lowcardinality|enum/i.test(column.type)).slice(0, 40);
 }
 
 function buildTools(context: DatasetContext, datasetId: string) {
@@ -248,6 +302,12 @@ function buildTools(context: DatasetContext, datasetId: string) {
   const workflow = createWorkflowReporter();
   const primary = context.tables[0];
   const allowedTables = context.tables.map((source) => source.table);
+  const searchCache = new Map<string, Promise<SearchResult>>();
+  const sourceForTable = (table?: string) => {
+    const source = table ? context.tables.find((candidate) => candidate.table === table) : primary;
+    if (!source) throw new Error("The requested table is not part of this dataset");
+    return source;
+  };
   const runQuery = async (stage: Extract<AgentStage, "inspecting" | "searching" | "querying" | "ranking">, message: string, sql: string) => {
     return workflow.activity(stage, message, async () => {
       const verified = validateReadOnlySql(sql, allowedTables);
@@ -258,22 +318,57 @@ function buildTools(context: DatasetContext, datasetId: string) {
   };
   return {
     inspect_dataset: tool({
-      description: "Return the dataset schema, table name, and a small sample. Call this before answering an unfamiliar question.",
-      inputSchema: z.object({}),
-      execute: async () => {
-        const sample = await runQuery("inspecting", "Reading a small dataset sample", `SELECT * FROM ${primary.table} LIMIT 3`);
+      description: "Return the stored schema and a small sample for one imported table. The schema for every table is already available in the system context; call this only when an unfamiliar table needs sample values.",
+      inputSchema: z.object({ table: z.string().optional() }),
+      execute: async ({ table }) => {
+        const source = sourceForTable(table);
+        const sample = await runQuery("inspecting", "Reading a small dataset sample", `SELECT * FROM ${source.table} LIMIT 3`);
         return { datasetId, version: context.version, tables: context.tables, sample: sample.rows };
       },
     }),
     search_records: tool({
-      description: "Fuzzy-search people, titles, entities, and phrases across text-like columns. Use this before giving up on spelling variations, partial names, or multiple entities in one question.",
+      description: "Search every imported table for a person, title, entity, or phrase using case-insensitive substring matching. Call exactly once for each named entity before making an assumption. The result identifies the searched files and fields. If it returns zero rows, say the dataset has no evidence; never substitute a person from outside knowledge. If it returns multiple candidates, explain the candidate evidence and your selection.",
       inputSchema: z.object({ query: z.string().min(1).max(160), limit: z.number().int().min(1).max(20).default(10) }),
       execute: async ({ query, limit }) => {
-        const searchable = primary.columns.map((column) => column.name).slice(0, 40);
         const terms = query.toLowerCase().split(/\s+/).filter((term) => term.length > 1).slice(0, 6);
-        const predicates = terms.flatMap((term) => searchable.map((column) => `positionCaseInsensitiveUTF8(toString(\`${column.replace(/`/g, "")}\`), ${quote(term)}) > 0`));
-        if (!predicates.length) return { query, rows: [], note: "No searchable terms supplied" };
-        return runQuery("searching", `Searching matching records for “${query}”`, `SELECT * FROM ${primary.table} WHERE ${predicates.join(" OR ")} LIMIT ${limit}`);
+        if (!terms.length) return { query, rows: [], rowCount: 0, searched: [], note: "No searchable terms supplied" } satisfies SearchResult;
+        const cacheKey = `${terms.join(" ")}:${limit}`;
+        let search = searchCache.get(cacheKey);
+        const isNewSearch = !search;
+        if (!search) {
+          const sources = context.tables.map((source) => ({ source, columns: textColumns(source) })).filter(({ columns }) => columns.length);
+          search = workflow.activity("searching", `Searching all imported text fields for “${query}”`, async () => {
+            const resultSets = await Promise.all(sources.map(async ({ source, columns }) => {
+              const predicates = terms.map((term) => `(${columns.map((column) => `positionCaseInsensitiveUTF8(toString(${quoteIdentifier(column.name)}), ${quote(term)}) > 0`).join(" OR ")})`);
+              const sql = `SELECT *, ${quote(source.sourcePath ?? source.table)} AS _source_file FROM ${source.table} WHERE ${predicates.join(" AND ")} LIMIT ${limit}`;
+              const verified = validateReadOnlySql(sql, [source.table]);
+              if (!verified.ok) throw new Error(verified.error);
+              return clickhouse.query<Record<string, unknown>>(sql, { timeoutMs: 15_000 });
+            }));
+            const rows = resultSets.flatMap((result) => result.rows).slice(0, limit);
+            return {
+              query,
+              rows,
+              rowCount: rows.length,
+              searched: sources.map(({ source, columns }) => ({ source: source.sourcePath ?? source.table, fields: columns.map((column) => column.name) })),
+              note: rows.length
+                ? `Found ${rows.length} matching record${rows.length === 1 ? "" : "s"} across ${sources.length} imported file${sources.length === 1 ? "" : "s"}`
+                : `No matching values in ${sources.length} imported file${sources.length === 1 ? "" : "s"}; do not infer an entity from outside this dataset`,
+            } satisfies SearchResult;
+          }, (result) => result.rowCount
+            ? `Found ${result.rowCount} matching record${result.rowCount === 1 ? "" : "s"} across all imported files`
+            : `No matching values across ${result.searched.length} imported files`);
+          searchCache.set(cacheKey, search);
+        }
+        const result = await search;
+        if (isNewSearch) {
+          chat.response.write({
+            type: "data-entity-evidence",
+            id: `entity-evidence-${crypto.randomUUID()}`,
+            data: entityEvidence(result),
+          } as never);
+        }
+        return result;
       },
     }),
     query_clickhouse: tool({
@@ -282,16 +377,17 @@ function buildTools(context: DatasetContext, datasetId: string) {
       execute: async ({ sql }) => runQuery("querying", "Running a read-only ClickHouse query", sql),
     }),
     rank_entities: tool({
-      description: "Rank entities such as players or movies using multiple numeric columns. Use this for top/best/strongest questions instead of ordering by one arbitrary metric. The score normalizes each selected metric to 0..1 before averaging.",
-      inputSchema: z.object({ entityColumn: z.string().min(1), metricColumns: z.array(z.string().min(1)).min(2).max(8), limit: z.number().int().min(1).max(25).default(10) }),
-      execute: async ({ entityColumn, metricColumns, limit }) => {
-        const allowed = new Set(primary.columns.map((column) => column.name));
+      description: "Rank records from a selected imported table using multiple numeric columns. Use this for top/best/strongest questions instead of ordering by one arbitrary metric. The score normalizes each selected metric to 0..1 before averaging.",
+      inputSchema: z.object({ table: z.string().optional(), entityColumn: z.string().min(1), metricColumns: z.array(z.string().min(1)).min(2).max(8), limit: z.number().int().min(1).max(25).default(10) }),
+      execute: async ({ table, entityColumn, metricColumns, limit }) => {
+        const source = sourceForTable(table);
+        const allowed = new Set(source.columns.map((column) => column.name));
         if (!allowed.has(entityColumn) || metricColumns.some((column) => !allowed.has(column))) throw new Error("Ranking requested columns that are not in the dataset schema");
         const quoteIdentifier = (value: string) => `\`${value.replace(/`/g, "")}\``;
         const bounds = metricColumns.map((column, index) => `min(${floatOrNull(quoteIdentifier(column))}) AS min_${index}, max(${floatOrNull(quoteIdentifier(column))}) AS max_${index}`).join(", ");
         const components = metricColumns.map((column, index) => `ifNull((${floatOrNull(quoteIdentifier(column))} - min_${index}) / nullIf(max_${index} - min_${index}, 0), 0)`).join(" + ");
         const selected = metricColumns.map((column) => quoteIdentifier(column)).join(", ");
-        const sql = `WITH bounds AS (SELECT ${bounds} FROM ${primary.table}), scored AS (SELECT ${quoteIdentifier(entityColumn)} AS entity, (${components}) / ${metricColumns.length} AS composite_score, ${selected} FROM ${primary.table} CROSS JOIN bounds) SELECT * FROM scored WHERE entity IS NOT NULL ORDER BY composite_score DESC LIMIT ${limit}`;
+        const sql = `WITH bounds AS (SELECT ${bounds} FROM ${source.table}), scored AS (SELECT ${quoteIdentifier(entityColumn)} AS entity, (${components}) / ${metricColumns.length} AS composite_score, ${selected} FROM ${source.table} CROSS JOIN bounds) SELECT * FROM scored WHERE entity IS NOT NULL ORDER BY composite_score DESC LIMIT ${limit}`;
         return runQuery("ranking", `Ranking ${entityColumn} using ${metricColumns.length} metrics`, sql);
       },
     }),
@@ -350,7 +446,7 @@ export const datasetChat = chat
       if (!clientData) throw new Error("Dataset context is required");
       const context = datasetContext.get();
       const question = latestUserQuestion(messages);
-      const recommendation = question ? await prepareMovieRecommendations(context, question) : null;
+      const recommendation = question ? await prepareRatingRecommendations(context, question) : null;
       if (recommendation) {
         chat.response.write({
           type: "data-analyst-insight",
@@ -363,7 +459,7 @@ export const datasetChat = chat
         // Gemini is selected per session; Featherless retains its fast
         // non-reasoning default for sessions that do not opt into Gemini.
         model: resolveChatModel(clientData),
-        system: `You are a precise, fast data analyst. Answer only from ClickHouse results. Dataset tables and schemas: ${JSON.stringify(context.tables)}. The schema is already available, so for a straightforward question call query_clickhouse directly with one bounded query, then answer from its result. Use search_records only for names, titles, or fuzzy text lookup; use rank_entities only for multi-metric rankings. Do not inspect the dataset unless the user explicitly asks for a sample or schema. Call present_insight only when a table, chart, or cards materially improve the answer. ${recommendation ? "A verified recommendation table and chart have already been emitted. Give a one-sentence introduction only; do not call any tools or repeat the rows." : "Give the direct result first and keep ordinary answers under 160 words."} Do not describe hidden reasoning. Never invent facts.`,
+        system: `You are a precise, fast data analyst for arbitrary imported datasets. Answer only from ClickHouse results. Dataset tables and schemas: ${JSON.stringify(context.tables)}. Follow this evidence workflow on every answer: (1) identify the relevant table and requested constraints from the question; (2) resolve a named person, title, or entity with one search_records call before querying; (3) run a bounded read-only query that applies every supported constraint; (4) compare the result with the original question before answering, and explicitly state unsupported constraints or zero evidence. search_records searches every imported text field using substring matching. If it finds nothing, say what was searched and never infer an identity from outside knowledge. If it finds multiple candidates, state the candidates and the data-backed reason for any selection before continuing. Never repeat an identical tool call. Use rank_entities only for multi-metric rankings and select its table explicitly when necessary. Do not inspect the dataset unless a sample is necessary. Call present_insight only when a table, chart, or cards materially improve the answer. ${recommendation ? "A verified generic rating recommendation table has already been emitted. Do not call tools or emit text; the structured result is the complete answer." : "Give the direct result first and keep ordinary answers under 160 words."} Do not describe hidden reasoning. Never invent facts.`,
         messages,
         abortSignal: signal,
         maxOutputTokens: recommendation ? 100 : 240,

@@ -16,6 +16,12 @@ type Insight = {
 };
 type AgentStatus = { stage: string; message: string; at: string };
 type AgentEvent = { stage: string; message: string; state: "started" | "completed" | "failed"; at: string };
+type EntityEvidence = {
+  query: string;
+  candidates: Array<{ label: string; source: string; matched: Array<{ field: string; value: string }> }>;
+  searched: Array<{ source: string; fields: string[] }>;
+  conclusion: string;
+};
 type ChatActivity = Pick<AgentStatus, "stage" | "message">;
 type GeminiSettings = { baseURL?: string; model?: string };
 type ChatProvider = { kind: "featherless" } | { kind: "gemini"; settings: GeminiSettings };
@@ -36,7 +42,15 @@ function statusFromParts(parts: any[]): AgentStatus | undefined {
 }
 
 function eventsFromParts(parts: any[]): AgentEvent[] {
-  return parts.filter((part) => part?.type === "data-agent-event" && part.data?.message).map((part) => part.data as AgentEvent);
+  const seen = new Set<string>();
+  return parts.filter((part) => {
+    if (part?.type !== "data-agent-event" || !part.data?.message) return false;
+    const event = part.data as AgentEvent;
+    const key = `${event.stage}:${event.state}:${event.message}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).map((part) => part.data as AgentEvent);
 }
 
 function insightFromPart(part: any): Insight | null {
@@ -45,15 +59,30 @@ function insightFromPart(part: any): Insight | null {
   return value && typeof value.title === "string" && typeof value.summary === "string" ? value as Insight : null;
 }
 
+function entityEvidenceFromPart(part: any): EntityEvidence | null {
+  if (part?.type !== "data-entity-evidence") return null;
+  const value = part.data;
+  return value && typeof value.query === "string" && Array.isArray(value.candidates) && Array.isArray(value.searched) && typeof value.conclusion === "string" ? value as EntityEvidence : null;
+}
+
+function EntityEvidenceView({ evidence }: { evidence: EntityEvidence }) {
+  return <aside style={{ marginTop: 10, padding: 14, border: "1px solid #bfdbfe", borderRadius: 10, background: "#eff6ff" }}>
+    <strong>Entity evidence · “{evidence.query}”</strong>
+    <p style={{ margin: "6px 0", color: "#334155" }}>{evidence.conclusion}</p>
+    {evidence.candidates.length ? <div style={{ display: "grid", gap: 8 }}>{evidence.candidates.map((candidate, index) => <div key={index} style={{ padding: 10, borderRadius: 8, background: "white", border: "1px solid #dbeafe" }}><strong>{candidate.label}</strong><small style={{ display: "block", color: "#64748b" }}>Source: {candidate.source}</small>{candidate.matched.map((match, matchIndex) => <p key={matchIndex} style={{ margin: "5px 0 0", fontSize: 13, color: "#334155" }}><b>{match.field}:</b> {match.value}</p>)}</div>)}</div> : <small style={{ color: "#64748b" }}>Searched: {evidence.searched.map((source) => source.source).join(", ")}</small>}
+  </aside>;
+}
+
 function InsightView({ insight }: { insight: Insight }) {
   const chart = insight.chart;
+  const hasTable = Boolean(insight.table?.rows?.length);
   const max = chart?.y ? Math.max(1, ...chart.data.map((row) => Number(row[chart.y!] ?? 0)).filter(Number.isFinite)) : 1;
   return <article style={{ marginTop: 10, padding: 16, border: "1px solid #cbd5e1", borderRadius: 12, background: "#f8fafc" }}>
     <h3 style={{ margin: 0 }}>{insight.title}</h3>
     <p>{insight.summary}</p>
     {insight.cards?.length ? <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: 10 }}>{insight.cards.map((card, index) => <div key={index} style={{ background: "white", borderRadius: 8, padding: 12, border: "1px solid #e2e8f0" }}><small>{card.label}</small><strong style={{ display: "block", fontSize: 20 }}>{card.value}</strong>{card.detail && <small>{card.detail}</small>}</div>)}</div> : null}
-    {insight.table?.rows?.length ? <div style={{ overflowX: "auto", marginTop: 12 }}><table style={{ borderCollapse: "collapse", width: "100%" }}><thead><tr>{insight.table.columns.map((column) => <th key={column} style={{ textAlign: "left", borderBottom: "1px solid #cbd5e1", padding: 8 }}>{column}</th>)}</tr></thead><tbody>{insight.table.rows.map((row, rowIndex) => <tr key={rowIndex}>{insight.table!.columns.map((column) => <td key={column} style={{ borderBottom: "1px solid #e2e8f0", padding: 8 }}>{String(row[column] ?? "—")}</td>)}</tr>)}</tbody></table></div> : null}
-    {chart?.type && chart.type !== "none" && chart.data.length && chart.x && chart.y ? <div style={{ display: "grid", gap: 8, marginTop: 14 }}>{chart.data.map((row, index) => { const value = Number(row[chart.y!] ?? 0); return <div key={index} style={{ display: "grid", gridTemplateColumns: "minmax(90px, 1fr) 3fr auto", gap: 8, alignItems: "center" }}><small style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{String(row[chart.x!] ?? "—")}</small><div style={{ height: 10, borderRadius: 99, background: "#e2e8f0", overflow: "hidden" }}><div style={{ width: `${Math.max(0, Math.min(100, (value / max) * 100))}%`, height: "100%", background: "linear-gradient(90deg,#2563eb,#7c3aed)" }} /></div><small>{String(row[chart.y!] ?? "—")}</small></div>; })}</div> : null}
+    {hasTable ? <div style={{ overflowX: "auto", marginTop: 12 }}><table style={{ borderCollapse: "collapse", width: "100%" }}><thead><tr>{insight.table!.columns.map((column) => <th key={column} style={{ textAlign: "left", borderBottom: "1px solid #cbd5e1", padding: 8 }}>{column}</th>)}</tr></thead><tbody>{insight.table!.rows.map((row, rowIndex) => <tr key={rowIndex}>{insight.table!.columns.map((column) => <td key={column} style={{ borderBottom: "1px solid #e2e8f0", padding: 8 }}>{String(row[column] ?? "—")}</td>)}</tr>)}</tbody></table></div> : null}
+    {!hasTable && chart?.type && chart.type !== "none" && chart.data.length && chart.x && chart.y ? <div style={{ display: "grid", gap: 8, marginTop: 14 }}>{chart.data.map((row, index) => { const value = Number(row[chart.y!] ?? 0); return <div key={index} style={{ display: "grid", gridTemplateColumns: "minmax(90px, 1fr) 3fr auto", gap: 8, alignItems: "center" }}><small style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{String(row[chart.x!] ?? "—")}</small><div style={{ height: 10, borderRadius: 99, background: "#e2e8f0", overflow: "hidden" }}><div style={{ width: `${Math.max(0, Math.min(100, (value / max) * 100))}%`, height: "100%", background: "linear-gradient(90deg,#2563eb,#7c3aed)" }} /></div><small>{String(row[chart.y!] ?? "—")}</small></div>; })}</div> : null}
     {insight.caveat && <small style={{ color: "#64748b" }}>{insight.caveat}</small>}
   </article>;
 }
@@ -61,11 +90,12 @@ function InsightView({ insight }: { insight: Insight }) {
 function WorkTrace({ parts }: { parts: any[] }) {
   const steps = parts.filter((part) => part.type === "tool-inspect_dataset" || part.type === "tool-search_records" || part.type === "tool-query_clickhouse" || part.type === "tool-rank_entities");
   if (!steps.length) return null;
-  return <details style={{ marginTop: 10, border: "1px solid #e2e8f0", borderRadius: 8, padding: "8px 12px", background: "white" }}>
+  const includesEntitySearch = steps.some((step) => step.type === "tool-search_records");
+  return <details open={includesEntitySearch} style={{ marginTop: 10, border: "1px solid #e2e8f0", borderRadius: 8, padding: "8px 12px", background: "white" }}>
     <summary style={{ cursor: "pointer", fontWeight: 600 }}>Show work · {steps.length} ClickHouse step{steps.length === 1 ? "" : "s"}</summary>
     {steps.map((step, index) => {
       const output = step.output ?? step.result;
-      return <div key={index} style={{ marginTop: 12, paddingTop: 12, borderTop: index ? "1px solid #e2e8f0" : undefined }}><strong>{index + 1}. {step.type.replace("tool-", "").replaceAll("_", " ")}</strong>{step.input && <pre style={{ whiteSpace: "pre-wrap", fontSize: 12, color: "#475569" }}>{JSON.stringify(step.input, null, 2)}</pre>}{output?.sql && <pre style={{ whiteSpace: "pre-wrap", overflowX: "auto", fontSize: 12, background: "#0f172a", color: "#e2e8f0", padding: 10, borderRadius: 6 }}>{output.sql}</pre>}{typeof output?.rowCount === "number" && <small>Returned {output.rowCount} row{output.rowCount === 1 ? "" : "s"}</small>}{output?.rows?.length ? <pre style={{ whiteSpace: "pre-wrap", overflowX: "auto", fontSize: 11 }}>{JSON.stringify(output.rows.slice(0, 5), null, 2)}</pre> : null}</div>;
+      return <div key={index} style={{ marginTop: 12, paddingTop: 12, borderTop: index ? "1px solid #e2e8f0" : undefined }}><strong>{index + 1}. {step.type.replace("tool-", "").replaceAll("_", " ")}</strong>{step.input && <pre style={{ whiteSpace: "pre-wrap", fontSize: 12, color: "#475569" }}>{JSON.stringify(step.input, null, 2)}</pre>}{output?.note && <p style={{ margin: "8px 0", color: "#334155" }}>{output.note}</p>}{output?.searched?.length ? <small>Searched: {output.searched.map((item: { source: string }) => item.source).join(", ")}</small> : null}{output?.sql && <pre style={{ whiteSpace: "pre-wrap", overflowX: "auto", fontSize: 12, background: "#0f172a", color: "#e2e8f0", padding: 10, borderRadius: 6 }}>{output.sql}</pre>}{typeof output?.rowCount === "number" && <small style={{ display: "block", marginTop: 6 }}>Returned {output.rowCount} row{output.rowCount === 1 ? "" : "s"}</small>}{output?.rows?.length ? <pre style={{ whiteSpace: "pre-wrap", overflowX: "auto", fontSize: 11 }}>{JSON.stringify(output.rows.slice(0, 5), null, 2)}</pre> : null}</div>;
     })}
   </details>;
 }
@@ -120,15 +150,18 @@ function DatasetChatSession({ datasetId, provider }: { datasetId: string; provid
   return <>
     <div>{activity && !latestAssistantId && <WorkflowTrace parts={[]} activity={activity} />}{messages.map((message: any) => {
       const isLiveAssistant = Boolean(activity) && message.role === "assistant" && message.id === latestAssistantId;
+      const hasInsight = message.role === "assistant" && message.parts?.some((part: any) => Boolean(insightFromPart(part)));
       return <div key={message.id} style={{ margin: "16px 0" }}><strong>{message.role === "user" ? "You" : "Analyst"}</strong>{message.role === "assistant" && <WorkflowTrace parts={message.parts ?? []} activity={isLiveAssistant ? activity : null} />}{message.parts?.map((part: any, index: number) => {
-        if (part.type === "text") return <p key={index}>{part.text}{isLiveAssistant && <span aria-hidden="true" style={{ color: "#0284c7" }}> ▍</span>}</p>;
+        if (part.type === "text") return hasInsight ? null : <p key={index}>{part.text}{isLiveAssistant && <span aria-hidden="true" style={{ color: "#0284c7" }}> ▍</span>}</p>;
         const insight = insightFromPart(part);
         if (insight) return <InsightView key={index} insight={insight} />;
+        const evidence = entityEvidenceFromPart(part);
+        if (evidence) return <EntityEvidenceView key={index} evidence={evidence} />;
         return null;
       })}{message.role === "assistant" && <WorkTrace parts={message.parts ?? []} />}</div>;
     })}</div>
     {(error || transportError) && <p role="alert" style={{ marginTop: 12, color: "#b91c1c" }}>{error?.message ?? transportError}</p>}
-    <form onSubmit={submit} style={{ display: "flex", gap: 12, marginTop: 16 }}><input value={input} onChange={(event) => setInput(event.target.value)} placeholder="e.g. Which Nolan movie features Leonardo DiCaprio?" style={{ flex: 1, padding: 12 }} /><button disabled={busy}>{status === "submitted" ? "Connecting…" : status === "streaming" ? "Analysing…" : "Ask"}</button>{busy && <button type="button" onClick={() => { setActivity({ stage: "planning", message: "Stopping the analyst" }); stop(); }}>Stop</button>}</form>
+    <form onSubmit={submit} style={{ display: "flex", gap: 12, marginTop: 16 }}><input value={input} onChange={(event) => setInput(event.target.value)} placeholder="e.g. Compare the highest-rated records with at least 500 reviews" style={{ flex: 1, padding: 12 }} /><button disabled={busy}>{status === "submitted" ? "Connecting…" : status === "streaming" ? "Analysing…" : "Ask"}</button>{busy && <button type="button" onClick={() => { setActivity({ stage: "planning", message: "Stopping the analyst" }); stop(); }}>Stop</button>}</form>
   </>;
 }
 
