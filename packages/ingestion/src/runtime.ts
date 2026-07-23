@@ -36,10 +36,18 @@ export interface KaggleCliOptions { executable?: string; execFile?: ExecFile; te
 export class KaggleCliGateway implements KaggleGateway {
   private readonly executable: string; private readonly run: ExecFile; private readonly tempDir?: string;
   constructor(options: KaggleCliOptions = {}) { this.executable = options.executable ?? 'kaggle'; this.run = options.execFile ?? defaultExec; this.tempDir = options.tempDir; }
+  private command(args: readonly string[]) {
+    // Trigger's Python build extension installs console scripts in a Python
+    // environment that is not always on Node's PATH. Running the module keeps
+    // the production worker independent of that console-script location.
+    if (this.executable === 'python' || this.executable === 'python3') return { file: this.executable, args: ['-m', 'kaggle', ...args] };
+    return { file: this.executable, args: [...args] };
+  }
   async list(ref: KaggleDatasetRef) {
     const datasetRef = ref.version === undefined ? `${ref.owner}/${ref.slug}` : `${ref.owner}/${ref.slug}/versions/${ref.version}`;
     const args = ['datasets', 'files', '-d', datasetRef, '--format', 'json'];
-    const { stdout } = await this.run(this.executable, args);
+    const command = this.command(args);
+    const { stdout } = await this.run(command.file, command.args);
     const files = parseListing(stdout).map(file => ({ ...file, async download() { throw new Error('download() is bound by KaggleCliGateway.list'); } }));
     const version = ref.version ?? 1;
     return { version, files: files.map(file => ({ ...file, download: () => this.download(ref, file.path) })) };
@@ -50,7 +58,8 @@ export class KaggleCliGateway implements KaggleGateway {
     try {
       const datasetRef = ref.version === undefined ? `${ref.owner}/${ref.slug}` : `${ref.owner}/${ref.slug}/versions/${ref.version}`;
       const args = ['datasets', 'download', '-d', datasetRef, '-f', path, '-p', dir, '--unzip', '--force'];
-      await this.run(this.executable, args);
+      const command = this.command(args);
+      await this.run(command.file, command.args);
       return new Uint8Array(await readFile(join(dir, path)));
     } finally { await rm(dir, { recursive: true, force: true }); }
   }
