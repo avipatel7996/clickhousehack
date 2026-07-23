@@ -40,6 +40,14 @@ create table if not exists public.analysis_runs (
 );
 alter table public.analysis_runs add column if not exists error_message text;
 
+-- The Trigger worker uses the Supabase service role and must be able to read
+-- and update these tables even though browser access remains RLS-protected.
+grant usage on schema public to service_role;
+grant all privileges on all tables in schema public to service_role;
+grant all privileges on all sequences in schema public to service_role;
+alter default privileges in schema public grant all on tables to service_role;
+alter default privileges in schema public grant all on sequences to service_role;
+
 alter table public.workspaces enable row level security;
 alter table public.workspace_members enable row level security;
 alter table public.dataset_imports enable row level security;
