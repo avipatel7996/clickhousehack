@@ -1,0 +1,158 @@
+/** Production adapters for the ingestion service. All side effects are injectable for tests. */
+import { execFile as nodeExecFile } from 'node:child_process';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { promisify } from 'node:util';
+import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import type { ClickHouseConfig } from '../../core/src/types';
+import type { KaggleDatasetRef } from './url';
+import type { KaggleFile, KaggleGateway, ObjectStore, ClickHouseLoader } from './service';
+import type { ManifestFile } from './manifest';
+import { normalizeIdentifier } from './identifiers';
+
+type ExecResult = { stdout: string; stderr: string };
+export type ExecFile = (file: string, args: readonly string[], options?: { maxBuffer?: number }) => Promise<ExecResult>;
+const defaultExec: ExecFile = (file, args, options) => promisify(nodeExecFile)(file, args as string[], { ...options, encoding: 'utf8' }) as unknown as Promise<ExecResult>;
+
+function parseListing(stdout: string): Array<{ path: string; sizeBytes: number; etag?: string }> {
+  const text = stdout.trim();
+  if (!text) return [];
+  try {
+    const value: unknown = JSON.parse(text);
+    const rows = Array.isArray(value) ? value : (value && typeof value === 'object' && 'files' in value ? (value as { files: unknown }).files : []);
+    if (Array.isArray(rows)) return rows.map((r) => {
+      const x = r as Record<string, unknown>;
+      return { path: String(x.name ?? x.path ?? ''), sizeBytes: Number(x.sizeBytes ?? x.size ?? 0), ...(x.etag ? { etag: String(x.etag) } : {}) };
+    });
+  } catch { /* CLI versions print a table; parse that below. */ }
+  return text.split(/\r?\n/).slice(1).map(line => line.trim()).filter(Boolean).map(line => {
+    const cols = line.split(/\s{2,}|\t/).filter(Boolean);
+    return { path: cols[0] ?? '', sizeBytes: Number((cols[1] ?? '0').replace(/[^0-9]/g, '')) || 0 };
+  });
+}
+
+export interface KaggleCliOptions { executable?: string; execFile?: ExecFile; tempDir?: string }
+export class KaggleCliGateway implements KaggleGateway {
+  private readonly executable: string; private readonly run: ExecFile; private readonly tempDir?: string;
+  constructor(options: KaggleCliOptions = {}) { this.executable = options.executable ?? 'kaggle'; this.run = options.execFile ?? defaultExec; this.tempDir = options.tempDir; }
+  async list(ref: KaggleDatasetRef) {
+    const datasetRef = ref.version === undefined ? `${ref.owner}/${ref.slug}` : `${ref.owner}/${ref.slug}/versions/${ref.version}`;
+    const args = ['datasets', 'files', '-d', datasetRef, '--format', 'json'];
+    const { stdout } = await this.run(this.executable, args);
+    const files = parseListing(stdout).map(file => ({ ...file, async download() { throw new Error('download() is bound by KaggleCliGateway.list'); } }));
+    const version = ref.version ?? 1;
+    return { version, files: files.map(file => ({ ...file, download: () => this.download(ref, file.path) })) };
+  }
+  private async download(ref: KaggleDatasetRef, path: string): Promise<Uint8Array> {
+    if (!path || path.startsWith('/') || path.split('/').includes('..')) throw new Error('Unsafe Kaggle file path');
+    const dir = await mkdtemp(join(this.tempDir ?? tmpdir(), 'kaggle-'));
+    try {
+      const datasetRef = ref.version === undefined ? `${ref.owner}/${ref.slug}` : `${ref.owner}/${ref.slug}/versions/${ref.version}`;
+      const args = ['datasets', 'download', '-d', datasetRef, '-f', path, '-p', dir, '--unzip', '--force'];
+      await this.run(this.executable, args);
+      return new Uint8Array(await readFile(join(dir, path)));
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  }
+}
+
+export interface R2ObjectStoreOptions { endpoint: string; token?: string; fetch?: typeof globalThis.fetch; urlForKey?: (key: string) => string }
+export class R2ObjectStore implements ObjectStore {
+  private readonly options: R2ObjectStoreOptions; private readonly fetchImpl: typeof globalThis.fetch;
+  constructor(options: R2ObjectStoreOptions) { new URL(options.endpoint); this.options = options; this.fetchImpl = options.fetch ?? globalThis.fetch; if (!this.fetchImpl) throw new Error('A fetch implementation is required'); }
+  async put(key: string, body: ReadableStream<Uint8Array> | Uint8Array) {
+    if (!key || key.startsWith('/') || key.split('/').includes('..')) throw new Error('Unsafe object key');
+    const base = this.options.urlForKey ? this.options.urlForKey(key) : `${this.options.endpoint.replace(/\/$/, '')}/${key.split('/').map(encodeURIComponent).join('/')}`;
+    const headers: Record<string, string> = {}; if (this.options.token) headers.Authorization = `Bearer ${this.options.token}`;
+    const response = await this.fetchImpl(base, { method: 'PUT', headers, body: body as BodyInit });
+    if (!response.ok) throw new Error(`Object store PUT failed (${response.status})`);
+    return { key, etag: response.headers.get('etag') ?? undefined };
+  }
+}
+
+/** Cloudflare R2's native S3-compatible adapter. Uses access-key credentials and keeps keys workspace-scoped. */
+export class S3R2ObjectStore implements ObjectStore {
+  private readonly client: S3Client;
+  constructor(private readonly options: { endpoint: string; bucket: string; accessKeyId: string; secretAccessKey: string; region?: string }) {
+    new URL(options.endpoint);
+    this.client = new S3Client({ endpoint: options.endpoint, region: options.region ?? 'auto', credentials: { accessKeyId: options.accessKeyId, secretAccessKey: options.secretAccessKey } });
+  }
+  async put(key: string, body: ReadableStream<Uint8Array> | Uint8Array) {
+    if (!key || key.startsWith('/') || key.split('/').includes('..')) throw new Error('Unsafe object key');
+    const payload = body instanceof Uint8Array ? body : body as unknown as ReadableStream<Uint8Array>;
+    const result = await this.client.send(new PutObjectCommand({ Bucket: this.options.bucket, Key: key, Body: payload as any }));
+    return { key, etag: result.ETag };
+  }
+}
+
+export interface ClickHousePublisherOptions { config: ClickHouseConfig; table?: string; fetch?: typeof globalThis.fetch }
+export class ClickHousePublisher implements ClickHouseLoader {
+  private readonly options: ClickHousePublisherOptions; private readonly fetchImpl: typeof globalThis.fetch;
+  constructor(options: ClickHousePublisherOptions) { this.options = options; this.fetchImpl = options.fetch ?? options.config.fetch ?? globalThis.fetch; if (!this.fetchImpl) throw new Error('A fetch implementation is required'); }
+  async publish(input: { workspaceId: string; importId: string; sourceKeys: string[]; files: ManifestFile[]; contents?: Uint8Array[] }) {
+    if (input.contents?.length) return this.publishDatasets({ ...input, contents: input.contents });
+    const table = this.options.table ?? 'ingestion_files';
+    if (!/^[A-Za-z_][A-Za-z0-9_.]*$/.test(table)) throw new Error('Unsafe ClickHouse table identifier');
+    const rows = input.files.map((file, i) => ({ workspace_id: input.workspaceId, import_id: input.importId, source_key: input.sourceKeys[i], path: file.path, size_bytes: file.sizeBytes, etag: file.etag ?? null }));
+    const params = new URLSearchParams({ query: `INSERT INTO ${table} FORMAT JSONEachRow` }); if (this.options.config.database) params.set('database', this.options.config.database);
+    const headers: Record<string, string> = { 'Content-Type': 'application/x-ndjson', ...(this.options.config.headers ?? {}) }; if (this.options.config.username) headers['X-ClickHouse-User'] = this.options.config.username; if (this.options.config.password) headers['X-ClickHouse-Key'] = this.options.config.password;
+    const response = await this.fetchImpl(`${this.options.config.url.replace(/\/$/, '')}/?${params}`, { method: 'POST', headers, body: rows.map(row => JSON.stringify(row)).join('\n') + (rows.length ? '\n' : '') });
+    if (!response.ok) throw new Error(`ClickHouse publish failed (${response.status}): ${await response.text()}`);
+    return { tableIds: [table], rowCount: rows.length };
+  }
+
+  private async publishDatasets(input: { workspaceId: string; importId: string; sourceKeys: string[]; files: ManifestFile[]; contents: Uint8Array[] }) {
+    const tableIds: string[] = [];
+    let totalRows = 0;
+    for (let index = 0; index < input.files.length; index++) {
+      const file = input.files[index];
+      const content = input.contents[index];
+      const rows = parseTabular(content, file.path);
+      if (!rows.length) continue;
+      const columns = Object.keys(rows[0]);
+      const table = `${this.options.table ?? 'dataset'}_${normalizeIdentifier(input.importId).replace(/-/g, '_')}_${index}`;
+      if (!/^[A-Za-z_][A-Za-z0-9_.]*$/.test(table)) throw new Error('Unsafe ClickHouse table identifier');
+      const definitions = columns.map(column => `${quoteIdentifier(column)} Nullable(String)`).join(', ');
+      await this.execute(`CREATE TABLE IF NOT EXISTS ${table} (${definitions}) ENGINE = MergeTree ORDER BY tuple()`);
+      const payload = rows.map(row => JSON.stringify(Object.fromEntries(columns.map(column => [column, row[column] == null ? null : String(row[column])]))) ).join('\n') + '\n';
+      await this.execute(`INSERT INTO ${table} FORMAT JSONEachRow`, payload, 'application/x-ndjson');
+      tableIds.push(table); totalRows += rows.length;
+    }
+    return { tableIds, rowCount: totalRows };
+  }
+
+  private async execute(query: string, body?: string, contentType = 'text/plain') {
+    const params = new URLSearchParams({ query });
+    if (this.options.config.database) params.set('database', this.options.config.database);
+    const headers: Record<string, string> = { 'Content-Type': contentType, ...(this.options.config.headers ?? {}) };
+    if (this.options.config.username) headers['X-ClickHouse-User'] = this.options.config.username;
+    if (this.options.config.password) headers['X-ClickHouse-Key'] = this.options.config.password;
+    const response = await this.fetchImpl(`${this.options.config.url.replace(/\/$/, '')}/?${params}`, { method: 'POST', headers, body });
+    if (!response.ok) throw new Error(`ClickHouse query failed (${response.status}): ${await response.text()}`);
+  }
+}
+
+function quoteIdentifier(value: string) { return `\`${value.replace(/`/g, '').replace(/[^A-Za-z0-9_]+/g, '_').replace(/^\d/, '_$&') || 'column'}\``; }
+function parseTabular(bytes: Uint8Array, path: string): Array<Record<string, unknown>> {
+  const text = new TextDecoder().decode(bytes).replace(/^\uFEFF/, '');
+  const ext = path.slice(path.lastIndexOf('.')).toLowerCase();
+  if (['.jsonl', '.ndjson'].includes(ext)) return text.split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line));
+  if (ext === '.json') { const value = JSON.parse(text); return Array.isArray(value) ? value : [value]; }
+  if (ext === '.parquet') throw new Error('Parquet requires a ClickHouse S3 table function; configure an object-store URL for this source');
+  const delimiter = ext === '.tsv' ? '\t' : ',';
+  const records = parseDelimited(text, delimiter);
+  const headers = (records.shift() ?? []).map((header, index) => String(header || `column_${index + 1}`));
+  return records.map(record => Object.fromEntries(headers.map((header, index) => [header, record[index] ?? null])));
+}
+function parseDelimited(text: string, delimiter: string): string[][] {
+  const rows: string[][] = []; let row: string[] = []; let cell = ''; let quoted = false;
+  for (let index = 0; index < text.length; index++) { const char = text[index]; const next = text[index + 1];
+    if (char === '"' && quoted && next === '"') { cell += '"'; index++; continue; }
+    if (char === '"') { quoted = !quoted; continue; }
+    if (char === delimiter && !quoted) { row.push(cell); cell = ''; continue; }
+    if ((char === '\n' || char === '\r') && !quoted) { if (char === '\r' && next === '\n') index++; row.push(cell); rows.push(row); row = []; cell = ''; continue; }
+    cell += char;
+  }
+  if (cell.length || row.length) { row.push(cell); rows.push(row); }
+  return rows.filter(values => values.some(value => value.length));
+}

@@ -1,0 +1,48 @@
+"use client";
+
+import { FormEvent, useState } from "react";
+
+type Message = { role: "user" | "assistant"; text: string };
+
+export default function HomePage() {
+  const [url, setUrl] = useState("");
+  const [importStatus, setImportStatus] = useState("");
+  const [question, setQuestion] = useState("");
+  const [messages, setMessages] = useState<Message[]>([]);
+
+  async function importDataset(event: FormEvent) {
+    event.preventDefault();
+    setImportStatus("Validating Kaggle dataset…");
+    const response = await fetch("/api/imports", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ url }) });
+    const body = await response.json();
+    setImportStatus(body.message ?? body.error ?? "Import request accepted.");
+  }
+
+  async function askQuestion(event: FormEvent) {
+    event.preventDefault();
+    if (!question.trim()) return;
+    const current = question;
+    setQuestion("");
+    setMessages((items) => [...items, { role: "user", text: current }]);
+    const response = await fetch("/api/analyses", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ question: current }) });
+    const body = await response.json();
+    setMessages((items) => [...items, { role: "assistant", text: body.answer ?? body.message ?? body.error ?? "Analysis queued." }]);
+  }
+
+  return <main style={{ maxWidth: 920, margin: "0 auto", padding: "48px 24px", fontFamily: "system-ui" }}>
+    <p style={{ color: "#64748b", letterSpacing: 1 }}>KAGGLE → CLICKHOUSE · <a href="/login">Sign in</a></p>
+    <h1>Ask your data, with evidence.</h1>
+    <p style={{ maxWidth: 650, color: "#475569" }}>Import a public Kaggle dataset and get answers backed by executed ClickHouse queries, immutable dataset versions, and visual summaries.</p>
+    <section style={{ marginTop: 32, padding: 24, border: "1px solid #e2e8f0", borderRadius: 12 }}>
+      <h2>1. Import a dataset</h2>
+      <form onSubmit={importDataset} style={{ display: "flex", gap: 12 }}><input value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://www.kaggle.com/datasets/owner/slug" style={{ flex: 1, padding: 12 }} /><button type="submit">Import</button></form>
+      {importStatus && <p role="status">{importStatus}</p>}
+    </section>
+    <section style={{ marginTop: 24, padding: 24, border: "1px solid #e2e8f0", borderRadius: 12 }}>
+      <h2>2. Ask a grounded question</h2>
+      <form onSubmit={askQuestion} style={{ display: "flex", gap: 12 }}><input value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="Which team has the strongest evidence?" style={{ flex: 1, padding: 12 }} /><button type="submit">Analyze</button></form>
+      <div aria-live="polite">{messages.map((message, index) => <p key={index}><strong>{message.role === "user" ? "You" : "Analyst"}:</strong> {message.text}</p>)}</div>
+    </section>
+    <small style={{ display: "block", marginTop: 24, color: "#64748b" }}>Forecasts are only produced when the dataset contains suitable historical outcomes and predictors. Otherwise the analyst explains what the data can support.</small>
+  </main>;
+}

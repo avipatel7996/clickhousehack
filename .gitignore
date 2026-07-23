@@ -1,0 +1,9 @@
+node_modules
+.venv
+.next
+.env*
+# This workspace's example file currently contains real local credentials.
+.env.example
+coverage
+dist
+.trigger
