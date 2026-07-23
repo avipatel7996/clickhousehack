@@ -1,4 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { KaggleCliGateway, R2ObjectStore, ClickHousePublisher } from '../src/runtime';
 
 describe('runtime ingestion adapters', () => {
@@ -23,6 +26,23 @@ describe('runtime ingestion adapters', () => {
     const gateway = new KaggleCliGateway({ executable: '/opt/venv/bin/python', execFile: exec });
     await gateway.list({ owner: 'acme', slug: 'demo', canonicalRef: 'acme/demo' });
     expect(exec).toHaveBeenCalledWith('/opt/venv/bin/python', ['-m', 'kaggle', 'datasets', 'files', '-d', 'acme/demo', '--format', 'json']);
+  });
+
+  it('accepts a uniquely normalized filename after the Kaggle CLI unzips it', async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), 'kaggle-gateway-test-'));
+    try {
+      const exec = vi.fn(async (_bin: string, args: readonly string[]) => {
+        if (args.includes('files')) return { stdout: JSON.stringify([{ name: 'Top_rated_movies (1).csv', size: 5 }]), stderr: '' };
+        const outputDir = args[args.indexOf('-p') + 1];
+        await writeFile(join(outputDir, 'Top_rated_movies.csv'), 'id\n1\n');
+        return { stdout: '', stderr: '' };
+      });
+      const gateway = new KaggleCliGateway({ execFile: exec, tempDir });
+      const [file] = (await gateway.list({ owner: 'acme', slug: 'demo', canonicalRef: 'acme/demo' })).files;
+      expect(new TextDecoder().decode(await file.download())).toBe('id\n1\n');
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
   });
 
   it('PUTs objects and publishes JSONEachRow with injected fetches', async () => {

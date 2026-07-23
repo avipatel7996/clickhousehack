@@ -21,6 +21,7 @@ export interface ImportRequest { workspaceId: string; importId: string; kaggleUr
 
 export type ImportProgress = {
   stage: "listing" | "downloading" | "uploading" | "publishing";
+  currentFile?: string;
   completedFiles?: number;
   totalFiles?: number;
   completedBytes?: number;
@@ -58,15 +59,17 @@ export async function importDataset(request: ImportRequest, deps: ImportDatasetD
   let completedBytes = 0;
   await deps.onProgress?.({ stage: "downloading", completedFiles, totalFiles: selected.length, completedBytes, totalBytes, message: `Downloading ${selected.length} file${selected.length === 1 ? '' : 's'} from Kaggle` });
   await mapWithConcurrency(selected, Math.min(Math.max(1, deps.fileConcurrency ?? 3), selected.length), async (file, index) => {
+    await deps.onProgress?.({ stage: "downloading", currentFile: file.path, completedFiles, totalFiles: selected.length, completedBytes, totalBytes, message: `Downloading ${file.path}` });
     const body = await file.download();
     const bytes = body instanceof Uint8Array ? body : new Uint8Array(await new Response(body).arrayBuffer());
-    await deps.onProgress?.({ stage: "uploading", completedFiles, totalFiles: selected.length, completedBytes, totalBytes, message: `Saving ${file.path}` });
+    await deps.onProgress?.({ stage: "downloading", currentFile: file.path, completedFiles, totalFiles: selected.length, completedBytes, totalBytes, message: `Downloaded ${file.path} (${bytes.byteLength.toLocaleString()} bytes)` });
+    await deps.onProgress?.({ stage: "uploading", currentFile: file.path, completedFiles, totalFiles: selected.length, completedBytes, totalBytes, message: `Saving ${file.path}` });
     const stored = await deps.objects.put(`imports/${request.workspaceId}/${request.importId}/source/${file.path}`, bytes);
     sourceKeys[index] = stored.key;
     if (contents) contents[index] = bytes;
     completedFiles++;
     completedBytes += bytes.byteLength;
-    await deps.onProgress?.({ stage: "uploading", completedFiles, totalFiles: selected.length, completedBytes, totalBytes, message: `Saved ${completedFiles} of ${selected.length} file${selected.length === 1 ? '' : 's'}` });
+    await deps.onProgress?.({ stage: "uploading", currentFile: file.path, completedFiles, totalFiles: selected.length, completedBytes, totalBytes, message: `Saved ${file.path} (${completedFiles} of ${selected.length})` });
   });
   await deps.onProgress?.({ stage: "publishing", completedFiles, totalFiles: selected.length, completedBytes, totalBytes, message: "Creating ClickHouse tables" });
   const published = await deps.clickhouse.publish({ workspaceId: request.workspaceId, importId: request.importId, sourceKeys, files: validated.files, ...(contents ? { contents } : {}) });

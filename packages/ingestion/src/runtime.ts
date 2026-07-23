@@ -1,6 +1,6 @@
 /** Production adapters for the ingestion service. All side effects are injectable for tests. */
 import { execFile as nodeExecFile } from 'node:child_process';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { promisify } from 'node:util';
@@ -93,9 +93,37 @@ export class KaggleCliGateway implements KaggleGateway {
       const args = ['datasets', 'download', '-d', datasetRef, '-f', path, '-p', dir, '--unzip', '--force'];
       const command = this.command(args);
       await this.run(command.file, command.args);
-      return new Uint8Array(await readFile(join(dir, path)));
+      return new Uint8Array(await this.readDownloadedFile(dir, path));
     } finally { await rm(dir, { recursive: true, force: true }); }
   }
+
+  private async readDownloadedFile(dir: string, requestedPath: string): Promise<Buffer> {
+    const directPath = join(dir, requestedPath);
+    try {
+      return await readFile(directPath);
+    } catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+    }
+
+    // Kaggle's CLI occasionally normalizes duplicate filenames during unzip
+    // (`Movie (1).csv` becomes `Movie.csv`) or extracts them under a folder.
+    // Resolve only an exact basename or a single duplicate-suffix variant so
+    // we never silently upload a different dataset file.
+    const entries = await readdir(dir, { recursive: true });
+    const requestedName = basename(requestedPath);
+    const exact = entries.find((entry) => basename(entry) === requestedName);
+    const normalized = entries.filter((entry) => kaggleFilenameKey(basename(entry)) === kaggleFilenameKey(requestedName));
+    const resolved = exact ?? (normalized.length === 1 ? normalized[0] : undefined);
+    if (!resolved) {
+      const found = entries.slice(0, 20).join(", ") || "no files";
+      throw new Error(`Kaggle download did not produce ${requestedPath}. Found: ${found}`);
+    }
+    return readFile(join(dir, resolved));
+  }
+}
+
+function kaggleFilenameKey(filename: string) {
+  return filename.toLocaleLowerCase().replace(/ \(\d+\)(?=\.[^.]+$)/, "");
 }
 
 export interface R2ObjectStoreOptions { endpoint: string; token?: string; fetch?: typeof globalThis.fetch; urlForKey?: (key: string) => string }

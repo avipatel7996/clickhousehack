@@ -20,6 +20,11 @@ function formatBytes(value?: number) {
   return `${(value / 1024 ** index).toFixed(index ? 1 : 0)} ${units[index]}`;
 }
 
+function formatTime(value: string) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleTimeString([], { hour12: false });
+}
+
 function ImportProgress({ active, onComplete }: { active: ActiveImport; onComplete: (runError?: string) => void }) {
   const { run, error } = useRealtimeRun(active.triggerRunId, {
     accessToken: active.triggerAccessToken,
@@ -27,13 +32,13 @@ function ImportProgress({ active, onComplete }: { active: ActiveImport; onComple
     skipColumns: ["payload", "output"],
     onComplete: (completedRun, completedError) => onComplete(errorMessage(completedError) ?? errorMessage(completedRun.error)),
   });
-  const progress = run?.metadata?.import as { stage?: string; message?: string; completedFiles?: number; totalFiles?: number; completedBytes?: number; totalBytes?: number; events?: Array<{ at: string; stage: string; message: string }> } | undefined;
+  const progress = run?.metadata?.import as { stage?: string; message?: string; completedFiles?: number; totalFiles?: number; completedBytes?: number; totalBytes?: number; events?: Array<{ at: string; stage: string; message: string; currentFile?: string }> } | undefined;
   const percent = progress?.totalFiles ? Math.round(((progress.completedFiles ?? 0) / progress.totalFiles) * 100) : undefined;
   const taskError = errorMessage(run?.error);
   return <div role="status" style={{ marginTop: 12, padding: 12, borderRadius: 8, background: "#f8fafc", color: "#334155" }}>
     <strong>{progress?.stage ?? run?.status?.toLowerCase() ?? "queued"}</strong>{progress?.message ? ` · ${progress.message}` : " · Waiting for a worker"}
     {progress?.totalFiles ? <><br /><small>{progress.completedFiles ?? 0}/{progress.totalFiles} files{progress.totalBytes ? ` · ${formatBytes(progress.completedBytes)} / ${formatBytes(progress.totalBytes)}` : ""}</small><progress style={{ display: "block", width: "100%", marginTop: 8 }} value={percent ?? undefined} max={100} /></> : null}
-    {progress?.events?.length ? <details style={{ marginTop: 8 }}><summary>Import events</summary><ol style={{ margin: "8px 0 0", paddingLeft: 20 }}>{progress.events.map((event, index) => <li key={`${event.at}-${index}`}><small>{new Date(event.at).toLocaleTimeString()} · {event.stage} · {event.message}</small></li>)}</ol></details> : null}
+    {progress?.events?.length ? <details open={Boolean(taskError || progress.stage === "failed")} style={{ marginTop: 10 }}><summary style={{ cursor: "pointer", fontWeight: 600 }}>Full import timeline ({progress.events.length})</summary><div style={{ maxHeight: 280, overflowY: "auto", marginTop: 8, padding: 10, borderRadius: 6, background: "#0f172a", color: "#e2e8f0", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12, lineHeight: 1.55 }}>{progress.events.map((event, index) => <div key={`${event.at}-${index}`} style={{ display: "grid", gridTemplateColumns: "72px 88px minmax(0, 1fr)", gap: 8, padding: "2px 0", borderBottom: "1px solid #1e293b" }}><span style={{ color: "#94a3b8" }}>{formatTime(event.at)}</span><span style={{ color: "#7dd3fc" }}>{event.stage}</span><span style={{ overflowWrap: "anywhere" }}>{event.message}</span></div>)}</div></details> : null}
     {taskError ? <><br /><small>Import failed: {taskError}</small></> : null}
     {error ? <><br /><small>Live progress disconnected: {error.message}. The final result is still saved.</small></> : null}
   </div>;

@@ -13,7 +13,7 @@ const inputSchema = z.object({
   selectedFiles: z.array(z.string()).max(20).default([]),
 });
 
-type ProgressSnapshot = ImportProgress | { stage: "published" | "failed"; message: string; rowCount?: number };
+type ProgressSnapshot = ImportProgress | { stage: "published" | "failed"; message: string; rowCount?: number; currentFile?: string };
 
 // Some already-created Supabase projects predate this optional column. Keep
 // the worker deployable while the SQL migration rolls out, but use the column
@@ -70,11 +70,13 @@ export const ingestDataset = task({
       if (result.error) throw result.error;
     };
 
-    const progressEvents: Array<{ at: string; stage: string; message: string }> = [];
+    const progressEvents: Array<{ at: string; stage: string; message: string; currentFile?: string }> = [];
     const reportProgress = async (progress: ProgressSnapshot) => {
       const updatedAt = new Date().toISOString();
-      progressEvents.push({ at: updatedAt, stage: progress.stage, message: progress.message });
-      const snapshot = { ...progress, updatedAt, events: progressEvents.slice(-20) };
+      progressEvents.push({ at: updatedAt, stage: progress.stage, message: progress.message, ...(progress.currentFile ? { currentFile: progress.currentFile } : {}) });
+      // 200 concise timeline entries remain well inside Trigger's 256 KB
+      // metadata limit while preserving a useful audit trail for large files.
+      const snapshot = { ...progress, updatedAt, events: progressEvents.slice(-200) };
       metadata.set("import", snapshot);
       logger.info("dataset import progress", { importId: input.importId, ...snapshot });
       if (supabase && progress.stage !== "published" && progress.stage !== "failed") {
