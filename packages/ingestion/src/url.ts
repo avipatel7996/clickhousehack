@@ -4,8 +4,9 @@ import { normalizeIdentifier } from './identifiers';
 export interface KaggleDatasetRef { owner: string; slug: string; version?: number; canonicalRef: string }
 
 export function parseKaggleDatasetUrl(input: string): KaggleDatasetRef {
+  const cleaned = input.trim().replace(/[),.;]+$/, '');
   let url: URL;
-  try { url = new URL(input); } catch { throw new IngestionError('INVALID_KAGGLE_URL', 'Invalid Kaggle dataset URL', { url: input }); }
+  try { url = new URL(cleaned); } catch { throw new IngestionError('INVALID_KAGGLE_URL', 'Invalid Kaggle dataset URL', { url: input }); }
   if (!['http:', 'https:'].includes(url.protocol) || !['kaggle.com', 'www.kaggle.com'].includes(url.hostname.toLowerCase())) throw new IngestionError('INVALID_KAGGLE_URL', 'Invalid Kaggle dataset URL', { url: input });
   const parts = url.pathname.split('/').filter(Boolean);
   if (parts.length < 3 || parts[0].toLowerCase() !== 'datasets') throw new IngestionError('INVALID_KAGGLE_URL', 'URL must point to /datasets/{owner}/{slug}', { url: input });
