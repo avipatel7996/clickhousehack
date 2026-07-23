@@ -4,7 +4,8 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { promisify } from 'node:util';
-import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import type { ClickHouseConfig } from '../../core/src/types';
 import type { KaggleDatasetRef } from './url';
 import type { KaggleFile, KaggleGateway, ObjectStore, ClickHouseLoader } from './service';
@@ -124,13 +125,29 @@ export class S3R2ObjectStore implements ObjectStore {
     const result = await this.client.send(new PutObjectCommand({ Bucket: this.options.bucket, Key: key, Body: payload as any }));
     return { key, etag: result.ETag };
   }
+  async getReadUrl(key: string) {
+    if (!key || key.startsWith('/') || key.split('/').includes('..')) throw new Error('Unsafe object key');
+    // The URL contains only a short-lived signature, never the R2 secret key.
+    return getSignedUrl(this.client, new GetObjectCommand({ Bucket: this.options.bucket, Key: key }), { expiresIn: 900 });
+  }
 }
 
-export interface ClickHousePublisherOptions { config: ClickHouseConfig; table?: string; fetch?: typeof globalThis.fetch }
+export interface ClickHousePublisherOptions {
+  config: ClickHouseConfig;
+  table?: string;
+  fetch?: typeof globalThis.fetch;
+  sourceUrlForKey?: (key: string) => Promise<string>;
+}
 export class ClickHousePublisher implements ClickHouseLoader {
   private readonly options: ClickHousePublisherOptions; private readonly fetchImpl: typeof globalThis.fetch;
   constructor(options: ClickHousePublisherOptions) { this.options = options; this.fetchImpl = options.fetch ?? options.config.fetch ?? globalThis.fetch; if (!this.fetchImpl) throw new Error('A fetch implementation is required'); }
+  needsContents(files: ManifestFile[]) {
+    // JSON arrays need the existing in-memory parser. JSONEachRow/NDJSON and
+    // self-describing Parquet are safely handled by ClickHouse itself.
+    return !this.options.sourceUrlForKey || files.some(file => file.path.toLowerCase().endsWith('.json'));
+  }
   async publish(input: { workspaceId: string; importId: string; sourceKeys: string[]; files: ManifestFile[]; contents?: Uint8Array[] }) {
+    if (this.options.sourceUrlForKey && !this.needsContents(input.files)) return this.publishFromObjectStore(input);
     if (input.contents?.length) return this.publishDatasets({ ...input, contents: input.contents });
     const table = this.options.table ?? 'ingestion_files';
     if (!/^[A-Za-z_][A-Za-z0-9_.]*$/.test(table)) throw new Error('Unsafe ClickHouse table identifier');
@@ -162,6 +179,31 @@ export class ClickHousePublisher implements ClickHouseLoader {
     return { tableIds, rowCount: totalRows };
   }
 
+  private async publishFromObjectStore(input: { workspaceId: string; importId: string; sourceKeys: string[]; files: ManifestFile[] }) {
+    const tableIds: string[] = [];
+    let totalRows = 0;
+    for (let index = 0; index < input.files.length; index++) {
+      const file = input.files[index];
+      const sourceKey = input.sourceKeys[index];
+      if (!sourceKey) throw new Error(`Missing object-store key for ${file.path}`);
+      const table = `${this.options.table ?? 'dataset'}_${normalizeIdentifier(input.importId).replace(/-/g, '_')}_${index}`;
+      if (!/^[A-Za-z_][A-Za-z0-9_.]*$/.test(table)) throw new Error('Unsafe ClickHouse table identifier');
+      const format = clickHouseFormatForPath(file.path);
+      const sourceUrl = await this.options.sourceUrlForKey!(sourceKey);
+      const source = `url(${quoteString(sourceUrl)}, ${quoteString(format)})`;
+      // Import IDs are immutable and task retries are serial. Recreate this
+      // unique table so a retry cannot append a duplicate partial import.
+      await this.execute(`DROP TABLE IF EXISTS ${table}`);
+      await this.execute(`CREATE TABLE ${table} ENGINE = MergeTree ORDER BY tuple() EMPTY AS SELECT * FROM ${source}`);
+      await this.execute(`INSERT INTO ${table} SELECT * FROM ${source}`);
+      const count = Number((await this.execute(`SELECT count() FROM ${table}`)).trim());
+      if (!Number.isSafeInteger(count) || count < 0) throw new Error(`Could not determine ClickHouse row count for ${file.path}`);
+      tableIds.push(table);
+      totalRows += count;
+    }
+    return { tableIds, rowCount: totalRows };
+  }
+
   private async execute(query: string, body?: string, contentType = 'text/plain') {
     const params = new URLSearchParams({ query });
     if (this.options.config.database) params.set('database', this.options.config.database);
@@ -169,11 +211,22 @@ export class ClickHousePublisher implements ClickHouseLoader {
     if (this.options.config.username) headers['X-ClickHouse-User'] = this.options.config.username;
     if (this.options.config.password) headers['X-ClickHouse-Key'] = this.options.config.password;
     const response = await this.fetchImpl(`${this.options.config.url.replace(/\/$/, '')}/?${params}`, { method: 'POST', headers, body });
-    if (!response.ok) throw new Error(`ClickHouse query failed (${response.status}): ${await response.text()}`);
+    const responseBody = await response.text();
+    if (!response.ok) throw new Error(`ClickHouse query failed (${response.status}): ${responseBody}`);
+    return responseBody;
   }
 }
 
 function quoteIdentifier(value: string) { return `\`${value.replace(/`/g, '').replace(/[^A-Za-z0-9_]+/g, '_').replace(/^\d/, '_$&') || 'column'}\``; }
+function quoteString(value: string) { return `'${value.replace(/'/g, "\\'")}'`; }
+function clickHouseFormatForPath(path: string) {
+  const lower = path.toLowerCase();
+  if (lower.endsWith('.csv')) return 'CSVWithNames';
+  if (lower.endsWith('.tsv')) return 'TSVWithNames';
+  if (lower.endsWith('.jsonl') || lower.endsWith('.ndjson')) return 'JSONEachRow';
+  if (lower.endsWith('.parquet')) return 'Parquet';
+  throw new Error(`ClickHouse object-store import does not support ${path}`);
+}
 function parseTabular(bytes: Uint8Array, path: string): Array<Record<string, unknown>> {
   const text = new TextDecoder().decode(bytes).replace(/^\uFEFF/, '');
   const ext = path.slice(path.lastIndexOf('.')).toLowerCase();

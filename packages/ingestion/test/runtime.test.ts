@@ -34,4 +34,21 @@ describe('runtime ingestion adapters', () => {
     expect(result.rowCount).toBe(1);
     expect(String(fetch.mock.calls[1][1]?.body)).toContain('"path":"a.csv"');
   });
+
+  it('lets ClickHouse import typed CSV directly from a short-lived object URL', async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>(async (url) => {
+      const query = new URL(String(url)).searchParams.get('query') ?? '';
+      return new Response(query.startsWith('SELECT count()') ? '3\n' : '', { status: 200 });
+    });
+    const publisher = new ClickHousePublisher({
+      config: { url: 'https://ch.test' },
+      fetch,
+      sourceUrlForKey: async () => 'https://r2.test/signed.csv?expires=soon',
+    });
+    const result = await publisher.publish({ workspaceId: 'w', importId: 'i', sourceKeys: ['imports/a.csv'], files: [{ path: 'a.csv', sizeBytes: 3 }] });
+    expect(publisher.needsContents([{ path: 'a.csv', sizeBytes: 3 }])).toBe(false);
+    expect(result).toEqual({ tableIds: ['dataset_i_0'], rowCount: 3 });
+    const queries = fetch.mock.calls.map(([url]) => new URL(String(url)).searchParams.get('query'));
+    expect(queries.some((query) => query?.includes("CSVWithNames"))).toBe(true);
+  });
 });

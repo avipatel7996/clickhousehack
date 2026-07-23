@@ -10,10 +10,13 @@ const clientDataSchema = z.object({
 });
 
 type DatasetContext = {
+  datasetId: string;
   table: string;
   version: string;
   columns: Array<{ name: string; type: string }>;
 };
+
+const datasetContext = chat.local<DatasetContext>({ id: "dataset-context" });
 
 function serviceSupabase() {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -36,7 +39,7 @@ async function resolveDataset(datasetId: string): Promise<DatasetContext> {
   const table = String(data.physical_tables[0]);
   const clickhouse = new ClickHouseClient(createClickHouseConfig());
   const schema = await clickhouse.query<{ name: string; type: string }>(`DESCRIBE TABLE ${table}`);
-  return { table, version: String(data.source_version ?? "unknown"), columns: schema.rows };
+  return { datasetId, table, version: String(data.source_version ?? "unknown"), columns: schema.rows };
 }
 
 function quote(value: string) { return `'${value.replace(/'/g, "''")}'`; }
@@ -47,14 +50,14 @@ function buildTools(context: DatasetContext, datasetId: string) {
     const verified = validateReadOnlySql(sql, [context.table]);
     if (!verified.ok) throw new Error(verified.error);
     const result = await clickhouse.query<Record<string, unknown>>(sql, { timeoutMs: 15_000 });
-    return { sql, rows: result.rows.slice(0, 50), rowCount: result.rows.length, table: context.table };
+    return { sql, rows: result.rows.slice(0, 20), rowCount: result.rows.length, table: context.table };
   };
   return {
     inspect_dataset: tool({
       description: "Return the dataset schema, table name, and a small sample. Call this before answering an unfamiliar question.",
       inputSchema: z.object({}),
       execute: async () => {
-        const sample = await runQuery(`SELECT * FROM ${context.table} LIMIT 5`);
+        const sample = await runQuery(`SELECT * FROM ${context.table} LIMIT 3`);
         return { datasetId, version: context.version, table: context.table, columns: context.columns, sample: sample.rows };
       },
     }),
@@ -108,26 +111,32 @@ export const datasetChat = chat
   .withClientData({ schema: clientDataSchema })
   .agent({
     id: "dataset-chat",
-    tools: async ({ clientData }) => {
+    machine: "small-1x",
+    maxDuration: 90,
+    idleTimeoutInSeconds: 60,
+    onBoot: async ({ clientData }) => {
       if (!clientData) throw new Error("Dataset context is required");
-      return buildTools(await resolveDataset(clientData.datasetId), clientData.datasetId);
+      datasetContext.init(await resolveDataset(clientData.datasetId));
     },
+    tools: async () => buildTools(datasetContext.get(), datasetContext.datasetId),
     onTurnStart: async () => {
       chat.response.write({ type: "data-agent-status", data: { stage: "planning" } } as never);
     },
     run: async ({ messages, tools, clientData, signal }) => {
       if (!clientData) throw new Error("Dataset context is required");
-      const context = await resolveDataset(clientData.datasetId);
+      const context = datasetContext.get();
       const apiKey = process.env.FEATHERLESS_API_KEY;
       if (!apiKey) throw new Error("FEATHERLESS_API_KEY is required");
       const provider = createOpenAI({ apiKey, baseURL: process.env.FEATHERLESS_BASE_URL ?? "https://api.featherless.ai/v1" });
       return streamText({
         ...chat.toStreamTextOptions({ tools }),
-        model: provider.chat(process.env.FEATHERLESS_MODEL ?? "meta-llama/Meta-Llama-3.1-70B-Instruct"),
-        system: `You are a precise data analyst. You answer questions only with evidence from ClickHouse. Dataset table: ${context.table}. Columns: ${JSON.stringify(context.columns)}. First inspect or search the dataset, then run any required SQL. For people, titles, and names use search_records with spelling variations before concluding there is no match. For top/best/strongest/ranking questions, identify the entity column and at least two relevant numeric/stat columns from the schema, then use rank_entities; do not order by one arbitrary metric. After evidence is available, call present_insight to create the response UI, then provide a concise final answer. Never invent facts.`,
+        model: provider.chat(process.env.FEATHERLESS_FAST_MODEL ?? "Qwen/Qwen3-8B"),
+        system: `You are a precise data analyst. Answer only from ClickHouse results. Dataset table: ${context.table}. Columns: ${JSON.stringify(context.columns)}. The schema is already available, so for a straightforward question call query_clickhouse directly with one bounded query, then answer from its result. Use search_records only for names, titles, or fuzzy text lookup; use rank_entities only for multi-metric rankings. Do not inspect the dataset unless the user explicitly asks for a sample or schema. Call present_insight only when a table, chart, or cards materially improve the answer. Never invent facts.`,
         messages,
         abortSignal: signal,
-        stopWhen: stepCountIs(8),
+        maxOutputTokens: 400,
+        temperature: 0,
+        stopWhen: stepCountIs(3),
       });
     },
   });

@@ -1,4 +1,4 @@
-import { tasks } from "@trigger.dev/sdk/v3";
+import { tasks } from "@trigger.dev/sdk";
 
 export type TriggerDispatch = { enabled: boolean; runId?: string; error?: string };
 

@@ -1,4 +1,4 @@
-import { task } from "@trigger.dev/sdk/v3";
+import { task } from "@trigger.dev/sdk";
 import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
 import { FeatherlessClient } from "../packages/analysis/src/client";
@@ -17,6 +17,7 @@ const inputSchema = z.object({
 export const analyzeDataset = task({
   id: "analyze-dataset",
   queue: { name: "analysis", concurrencyLimit: 5 },
+  maxDuration: 120,
   retry: { maxAttempts: 2, factor: 2, minTimeoutInMs: 500, maxTimeoutInMs: 10000, randomize: true },
   run: async (payload: z.input<typeof inputSchema>) => {
     const input = inputSchema.parse(payload);

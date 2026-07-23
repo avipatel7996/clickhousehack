@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { auth } from "@trigger.dev/sdk";
 import { parseKaggleDatasetUrl } from "../../../../../packages/ingestion/src/url";
 import { dispatchTask } from "../../../lib/trigger";
 import { ensureWorkspace, getAuthenticatedUser, getSupabaseServerClient } from "../../../lib/supabase-server";
@@ -15,9 +16,10 @@ export async function GET(request: Request) {
     if (error) return NextResponse.json({ error: error.message }, { status: 500 });
     return NextResponse.json({ imports: data ?? [] });
   }
-  const { data, error } = await supabase.from("dataset_imports").select("id,status,row_count,physical_tables,error_message,created_at").eq("id", id).eq("workspace_id", workspaceId ?? "").single();
+  const { data, error } = await supabase.from("dataset_imports").select("id,status,row_count,physical_tables,error_message,trigger_run_id,created_at").eq("id", id).eq("workspace_id", workspaceId ?? "").single();
   if (error) return NextResponse.json({ error: error.message }, { status: 404 });
-  return NextResponse.json(data);
+  const triggerAccessToken = data.trigger_run_id ? await mintRunToken(data.trigger_run_id) : undefined;
+  return NextResponse.json({ ...data, triggerAccessToken });
 }
 
 
@@ -58,9 +60,22 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: message, importId, live: false }, { status: 503 });
     }
     if (supabase && dispatch.runId) await supabase.from("dataset_imports").update({ trigger_run_id: dispatch.runId }).eq("id", importId).eq("workspace_id", workspaceId);
-    return NextResponse.json({ status: "queued", importId, workspaceId, triggerRunId: dispatch.runId, live: dispatch.enabled && !dispatch.error, warning: dispatch.error ?? (dispatch.enabled ? undefined : "Trigger.dev is not configured; running in demo mode.") }, { status: 202 });
+    const triggerAccessToken = dispatch.runId ? await mintRunToken(dispatch.runId) : undefined;
+    return NextResponse.json({ status: "queued", importId, workspaceId, triggerRunId: dispatch.runId, triggerAccessToken, live: dispatch.enabled && !dispatch.error, warning: dispatch.error ?? (dispatch.enabled ? undefined : "Trigger.dev is not configured; running in demo mode.") }, { status: 202 });
   } catch (error) {
     console.error("Dataset import setup failed", error);
     return NextResponse.json({ error: `Import setup failed: ${error instanceof Error ? error.message : "unknown error"}` }, { status: 500 });
+  }
+}
+
+async function mintRunToken(runId: string) {
+  try {
+    return await auth.createPublicToken({
+      scopes: { read: { runs: [runId] } },
+      expirationTime: "1h",
+      realtime: { skipColumns: ["payload", "output"] },
+    });
+  } catch {
+    return undefined;
   }
 }
