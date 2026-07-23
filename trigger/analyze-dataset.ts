@@ -27,8 +27,9 @@ export const analyzeDataset = task({
     let physicalTables: string[] = [];
     let version = "unknown";
     if (supabase) {
-      const result = await supabase.from("dataset_imports").select("physical_tables,source_version,status").eq("id", input.datasetId).eq("workspace_id", input.workspaceId).single();
+      const result = await supabase.from("dataset_imports").select("physical_tables,source_version,status").eq("id", input.datasetId).eq("workspace_id", input.workspaceId).maybeSingle();
       if (result.error) throw result.error;
+      if (!result.data) throw new Error("Dataset import was not found for this workspace. Sign in, import the dataset, and ask the question after the import is published.");
       physicalTables = Array.isArray(result.data.physical_tables) ? result.data.physical_tables.filter((value): value is string => typeof value === "string") : [];
       version = String(result.data.source_version ?? version);
       if (result.data.status !== "published" || !physicalTables.length) throw new Error("Dataset is not published or has no analytical table");
