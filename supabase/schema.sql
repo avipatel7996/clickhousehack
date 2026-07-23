@@ -45,6 +45,12 @@ alter table public.analysis_runs add column if not exists error_message text;
 grant usage on schema public to service_role;
 grant all privileges on all tables in schema public to service_role;
 grant all privileges on all sequences in schema public to service_role;
+grant usage on schema public to authenticated;
+grant select, insert on public.workspaces to authenticated;
+grant select, insert on public.workspace_members to authenticated;
+grant select, insert, update on public.dataset_imports to authenticated;
+grant select, insert, update on public.analysis_runs to authenticated;
+grant usage, select on all sequences in schema public to authenticated;
 alter default privileges in schema public grant all on tables to service_role;
 alter default privileges in schema public grant all on sequences to service_role;
 
