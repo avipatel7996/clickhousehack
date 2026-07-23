@@ -58,13 +58,19 @@ export async function importDataset(request: ImportRequest, deps: ImportDatasetD
   let completedFiles = 0;
   let completedBytes = 0;
   await deps.onProgress?.({ stage: "downloading", completedFiles, totalFiles: selected.length, completedBytes, totalBytes, message: `Downloading ${selected.length} file${selected.length === 1 ? '' : 's'} from Kaggle` });
-  await mapWithConcurrency(selected, Math.min(Math.max(1, deps.fileConcurrency ?? 3), selected.length), async (file, index) => {
+  await mapWithConcurrency(selected, Math.min(Math.max(1, deps.fileConcurrency ?? 3), selected.length), async (file, index, signal) => {
+    throwIfAborted(signal);
     await deps.onProgress?.({ stage: "downloading", currentFile: file.path, completedFiles, totalFiles: selected.length, completedBytes, totalBytes, message: `Downloading ${file.path}` });
+    throwIfAborted(signal);
     const body = await file.download();
+    throwIfAborted(signal);
     const bytes = body instanceof Uint8Array ? body : new Uint8Array(await new Response(body).arrayBuffer());
+    throwIfAborted(signal);
     await deps.onProgress?.({ stage: "downloading", currentFile: file.path, completedFiles, totalFiles: selected.length, completedBytes, totalBytes, message: `Downloaded ${file.path} (${bytes.byteLength.toLocaleString()} bytes)` });
+    throwIfAborted(signal);
     await deps.onProgress?.({ stage: "uploading", currentFile: file.path, completedFiles, totalFiles: selected.length, completedBytes, totalBytes, message: `Saving ${file.path}` });
     const stored = await deps.objects.put(`imports/${request.workspaceId}/${request.importId}/source/${file.path}`, bytes);
+    throwIfAborted(signal);
     sourceKeys[index] = stored.key;
     if (contents) contents[index] = bytes;
     completedFiles++;
@@ -77,14 +83,29 @@ export async function importDataset(request: ImportRequest, deps: ImportDatasetD
   return { importId: request.importId, status: 'published' as const, idempotencyKey: key, ...published };
 }
 
-async function mapWithConcurrency<T>(items: readonly T[], concurrency: number, worker: (item: T, index: number) => Promise<void>) {
+async function mapWithConcurrency<T>(items: readonly T[], concurrency: number, worker: (item: T, index: number, signal: AbortSignal) => Promise<void>) {
   let next = 0;
+  let failure: unknown;
+  const controller = new AbortController();
   const runWorker = async () => {
-    while (true) {
+    while (!controller.signal.aborted) {
       const index = next++;
       if (index >= items.length) return;
-      await worker(items[index], index);
+      try {
+        await worker(items[index], index, controller.signal);
+      } catch (error) {
+        if (!failure) {
+          failure = error;
+          controller.abort(error);
+        }
+        return;
+      }
     }
   };
   await Promise.all(Array.from({ length: concurrency }, runWorker));
+  if (failure) throw failure;
+}
+
+function throwIfAborted(signal: AbortSignal) {
+  if (signal.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("Import cancelled after another file failed");
 }

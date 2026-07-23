@@ -28,13 +28,13 @@ describe('runtime ingestion adapters', () => {
     expect(exec).toHaveBeenCalledWith('/opt/venv/bin/python', ['-m', 'kaggle', 'datasets', 'files', '-d', 'acme/demo', '--format', 'json']);
   });
 
-  it('accepts a uniquely normalized filename after the Kaggle CLI unzips it', async () => {
+  it('accepts a uniquely normalized percent-encoded filename after the Kaggle CLI unzips it', async () => {
     const tempDir = await mkdtemp(join(tmpdir(), 'kaggle-gateway-test-'));
     try {
       const exec = vi.fn(async (_bin: string, args: readonly string[]) => {
         if (args.includes('files')) return { stdout: JSON.stringify([{ name: 'Top_rated_movies (1).csv', size: 5 }]), stderr: '' };
         const outputDir = args[args.indexOf('-p') + 1];
-        await writeFile(join(outputDir, 'Top_rated_movies.csv'), 'id\n1\n');
+        await writeFile(join(outputDir, 'Top_rated_movies%20(1).csv'), 'id\n1\n');
         return { stdout: '', stderr: '' };
       });
       const gateway = new KaggleCliGateway({ execFile: exec, tempDir });

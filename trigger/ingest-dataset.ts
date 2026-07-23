@@ -71,7 +71,10 @@ export const ingestDataset = task({
     };
 
     const progressEvents: Array<{ at: string; stage: string; message: string; currentFile?: string }> = [];
+    let terminalProgress = false;
     const reportProgress = async (progress: ProgressSnapshot) => {
+      if (terminalProgress) return;
+      if (progress.stage === "published" || progress.stage === "failed") terminalProgress = true;
       const updatedAt = new Date().toISOString();
       progressEvents.push({ at: updatedAt, stage: progress.stage, message: progress.message, ...(progress.currentFile ? { currentFile: progress.currentFile } : {}) });
       // 200 concise timeline entries remain well inside Trigger's 256 KB

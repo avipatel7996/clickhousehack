@@ -123,7 +123,9 @@ export class KaggleCliGateway implements KaggleGateway {
 }
 
 function kaggleFilenameKey(filename: string) {
-  return filename.toLocaleLowerCase().replace(/ \(\d+\)(?=\.[^.]+$)/, "");
+  let decoded = filename;
+  try { decoded = decodeURIComponent(filename); } catch { /* Keep the literal name when malformed. */ }
+  return decoded.toLocaleLowerCase().replace(/ \(\d+\)(?=\.[^.]+$)/, "");
 }
 
 export interface R2ObjectStoreOptions { endpoint: string; token?: string; fetch?: typeof globalThis.fetch; urlForKey?: (key: string) => string }
