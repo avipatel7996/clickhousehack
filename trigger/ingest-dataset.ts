@@ -15,6 +15,11 @@ const inputSchema = z.object({
 
 type ProgressSnapshot = ImportProgress | { stage: "published" | "failed"; message: string; rowCount?: number };
 
+// Some already-created Supabase projects predate this optional column. Keep
+// the worker deployable while the SQL migration rolls out, but use the column
+// whenever it is present so failures survive past the realtime subscription.
+let errorMessageColumnAvailable: boolean | undefined;
+
 /** Durable entrypoint. Raw files stay in object storage; only references cross Trigger payload limits. */
 export const ingestDataset = task({
   id: "ingest-dataset",
@@ -39,15 +44,30 @@ export const ingestDataset = task({
         return result.data ? { importId: result.data.id, status: result.data.status } : null;
       },
       async markFailed(data: { importId: string; message: string }) {
-        if (!supabase) return;
-        const result = await supabase.from("dataset_imports").update({ status: "failed", error_message: data.message }).eq("id", data.importId).eq("workspace_id", input.workspaceId);
-        if (result.error) throw result.error;
+        await updateImport({ status: "failed" }, data.importId, data.message);
       },
       async markPublished(data: { importId: string; source: typeof ref; version: number; files: unknown[]; tableIds: string[]; rowCount: number }) {
-        if (!supabase) return;
-        const result = await supabase.from("dataset_imports").update({ status: "published", error_message: null, source_manifest: data.files, physical_tables: data.tableIds, row_count: data.rowCount, source_version: data.version }).eq("id", data.importId).eq("workspace_id", input.workspaceId);
-        if (result.error) throw result.error;
+        await updateImport({ status: "published", source_manifest: data.files, physical_tables: data.tableIds, row_count: data.rowCount, source_version: data.version }, data.importId, null);
       },
+    };
+
+    const updateImport = async (values: Record<string, unknown>, importId: string, errorMessage?: string | null) => {
+      if (!supabase) return;
+      const write = async (includeErrorMessage: boolean) => supabase
+        .from("dataset_imports")
+        .update(includeErrorMessage ? { ...values, error_message: errorMessage ?? null } : values)
+        .eq("id", importId)
+        .eq("workspace_id", input.workspaceId);
+      const includeErrorMessage = errorMessageColumnAvailable !== false;
+      let result = await write(includeErrorMessage);
+      if (includeErrorMessage && result.error?.code === "42703") {
+        errorMessageColumnAvailable = false;
+        logger.warn("dataset_imports.error_message is not deployed; falling back to realtime-only errors", { importId });
+        result = await write(false);
+      } else if (!result.error && includeErrorMessage) {
+        errorMessageColumnAvailable = true;
+      }
+      if (result.error) throw result.error;
     };
 
     const progressEvents: Array<{ at: string; stage: string; message: string }> = [];
@@ -59,8 +79,7 @@ export const ingestDataset = task({
       logger.info("dataset import progress", { importId: input.importId, ...snapshot });
       if (supabase && progress.stage !== "published" && progress.stage !== "failed") {
         const status = progress.stage === "listing" ? "inspecting" : "loading";
-        const update = await supabase.from("dataset_imports").update({ status, error_message: null }).eq("id", input.importId).eq("workspace_id", input.workspaceId);
-        if (update.error) throw update.error;
+        await updateImport({ status }, input.importId, null);
       }
     };
 
