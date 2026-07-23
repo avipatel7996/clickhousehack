@@ -146,6 +146,12 @@ type AnalystInsight = {
 
 function quoteIdentifier(value: string) { return `\`${value.replace(/`/g, "")}\``; }
 
+// ClickHouse's *OrNull conversion functions accept text only. Converting the
+// source to text first makes the analyst work with imported Float/Int columns
+// as well as CSV/JSON columns that were inferred as String.
+function floatOrNull(expression: string) { return `toFloat64OrNull(toString(${expression}))`; }
+function intOrNull(expression: string) { return `toInt64OrNull(toString(${expression}))`; }
+
 function latestUserQuestion(messages: unknown[]): string | undefined {
   for (const message of [...messages].reverse()) {
     if (!message || typeof message !== "object" || (message as { role?: unknown }).role !== "user") continue;
@@ -205,11 +211,13 @@ async function prepareMovieRecommendations(context: DatasetContext, question: st
   const rating = quoteIdentifier(source.rating);
   const votes = source.votes ? quoteIdentifier(source.votes) : undefined;
   const release = source.release ? quoteIdentifier(source.release) : undefined;
-  const voteSelect = votes ? `, max(toInt64OrNull(${votes})) AS movie_votes` : "";
+  const ratingValue = floatOrNull(rating);
+  const voteValue = votes ? intOrNull(votes) : undefined;
+  const voteSelect = voteValue ? `, max(${voteValue}) AS movie_votes` : "";
   const yearSelect = release ? `, max(toYear(${release})) AS release_year` : "";
-  const voteFilter = votes ? ` HAVING max(toInt64OrNull(${votes})) >= 500` : "";
+  const voteFilter = voteValue ? ` HAVING max(${voteValue}) >= 500` : "";
   const voteOrder = votes ? ", movie_votes DESC" : "";
-  const sql = `SELECT ${title} AS movie_title, max(toFloat64OrNull(${rating})) AS movie_rating${voteSelect}${yearSelect} FROM ${source.source.table} WHERE ${title} IS NOT NULL AND toFloat64OrNull(${rating}) >= 7.5 GROUP BY ${title}${voteFilter} ORDER BY movie_rating DESC${voteOrder} LIMIT 8`;
+  const sql = `SELECT ${title} AS movie_title, max(${ratingValue}) AS movie_rating${voteSelect}${yearSelect} FROM ${source.source.table} WHERE ${title} IS NOT NULL AND ${ratingValue} >= 7.5 GROUP BY ${title}${voteFilter} ORDER BY movie_rating DESC${voteOrder} LIMIT 8`;
   const result = await workflow.activity("querying", "3/4 Querying high-rated movies with enough reviews", async () => {
     const verified = validateReadOnlySql(sql, context.tables.map((table) => table.table));
     if (!verified.ok) throw new Error(verified.error);
@@ -280,8 +288,8 @@ function buildTools(context: DatasetContext, datasetId: string) {
         const allowed = new Set(primary.columns.map((column) => column.name));
         if (!allowed.has(entityColumn) || metricColumns.some((column) => !allowed.has(column))) throw new Error("Ranking requested columns that are not in the dataset schema");
         const quoteIdentifier = (value: string) => `\`${value.replace(/`/g, "")}\``;
-        const bounds = metricColumns.map((column, index) => `min(toFloat64OrNull(${quoteIdentifier(column)})) AS min_${index}, max(toFloat64OrNull(${quoteIdentifier(column)})) AS max_${index}`).join(", ");
-        const components = metricColumns.map((column, index) => `ifNull((toFloat64OrNull(${quoteIdentifier(column)}) - min_${index}) / nullIf(max_${index} - min_${index}, 0), 0)`).join(" + ");
+        const bounds = metricColumns.map((column, index) => `min(${floatOrNull(quoteIdentifier(column))}) AS min_${index}, max(${floatOrNull(quoteIdentifier(column))}) AS max_${index}`).join(", ");
+        const components = metricColumns.map((column, index) => `ifNull((${floatOrNull(quoteIdentifier(column))} - min_${index}) / nullIf(max_${index} - min_${index}, 0), 0)`).join(" + ");
         const selected = metricColumns.map((column) => quoteIdentifier(column)).join(", ");
         const sql = `WITH bounds AS (SELECT ${bounds} FROM ${primary.table}), scored AS (SELECT ${quoteIdentifier(entityColumn)} AS entity, (${components}) / ${metricColumns.length} AS composite_score, ${selected} FROM ${primary.table} CROSS JOIN bounds) SELECT * FROM scored WHERE entity IS NOT NULL ORDER BY composite_score DESC LIMIT ${limit}`;
         return runQuery("ranking", `Ranking ${entityColumn} using ${metricColumns.length} metrics`, sql);
