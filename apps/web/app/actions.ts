@@ -6,7 +6,7 @@ import { ensureWorkspace, getAuthenticatedUser, getSupabaseServerClient } from "
 
 const startSession = chat.createStartSessionAction("dataset-chat");
 
-type GeminiClientSettings = { apiKey?: string; baseURL?: string; model?: string };
+type GeminiClientSettings = { baseURL?: string; model?: string };
 type DatasetChatClientData = { datasetId: string; provider?: "featherless" | "gemini"; gemini?: GeminiClientSettings };
 
 /** Authorizes a browser session against the selected workspace before minting a session token. */

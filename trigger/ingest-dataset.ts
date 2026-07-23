@@ -5,6 +5,7 @@ import { importDataset, type ImportProgress } from "../packages/ingestion/src/se
 import { KaggleApiGateway, KaggleCliGateway, S3R2ObjectStore, ClickHousePublisher } from "../packages/ingestion/src/runtime";
 import { parseKaggleDatasetUrl } from "../packages/ingestion/src/url";
 import { clickHouseConfigFromEnv } from "../packages/clickhouse/src/env";
+import { ClickHouseClient } from "../packages/clickhouse/src/client";
 
 const inputSchema = z.object({
   importId: z.string().uuid(),
@@ -47,7 +48,28 @@ export const ingestDataset = task({
         await updateImport({ status: "failed" }, data.importId, data.message);
       },
       async markPublished(data: { importId: string; source: typeof ref; version: number; files: unknown[]; tableIds: string[]; rowCount: number }) {
-        await updateImport({ status: "published", source_manifest: data.files, physical_tables: data.tableIds, row_count: data.rowCount, source_version: data.version }, data.importId, null);
+        // Persist the schema while the import worker is already warm. Chat boot
+        // then reads this metadata from Supabase instead of cold-DESCRIBEing
+        // ClickHouse for every new analyst session.
+        let sourceManifest = data.files;
+        try {
+          const clickhouse = new ClickHouseClient(clickHouseConfigFromEnv());
+          const schemas = await Promise.all(data.tableIds.map(async (table) => ({
+            table,
+            columns: (await clickhouse.query<{ name: string; type: string }>(`DESCRIBE TABLE ${table}`, { timeoutMs: 15_000 })).rows,
+          })));
+          sourceManifest = data.files.map((file, index) => ({
+            ...(file && typeof file === "object" ? file as Record<string, unknown> : {}),
+            table: schemas[index]?.table,
+            columns: schemas[index]?.columns ?? [],
+          }));
+          logger.info("cached imported table schemas", { importId: data.importId, tableCount: schemas.length });
+        } catch (error) {
+          // The data itself is safely published. A later chat boot performs one
+          // compatible backfill rather than reporting a successful import as a failure.
+          logger.warn("could not cache imported table schemas", { importId: data.importId, error: error instanceof Error ? error.message : String(error) });
+        }
+        await updateImport({ status: "published", source_manifest: sourceManifest, physical_tables: data.tableIds, row_count: data.rowCount, source_version: data.version }, data.importId, null);
       },
     };
 

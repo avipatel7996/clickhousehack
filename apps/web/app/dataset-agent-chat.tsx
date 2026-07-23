@@ -17,12 +17,11 @@ type Insight = {
 type AgentStatus = { stage: string; message: string; at: string };
 type AgentEvent = { stage: string; message: string; state: "started" | "completed" | "failed"; at: string };
 type ChatActivity = Pick<AgentStatus, "stage" | "message">;
-type GeminiSettings = { apiKey?: string; baseURL?: string; model?: string };
+type GeminiSettings = { baseURL?: string; model?: string };
 type ChatProvider = { kind: "featherless" } | { kind: "gemini"; settings: GeminiSettings };
 
 const providerStorageKey = "clickhouse-analyst.gemini-settings";
 const defaultGeminiSettings: GeminiSettings = {
-  apiKey: "",
   baseURL: "https://generativelanguage.googleapis.com/v1beta",
   model: "gemini-flash-latest",
 };
@@ -41,8 +40,8 @@ function eventsFromParts(parts: any[]): AgentEvent[] {
 }
 
 function insightFromPart(part: any): Insight | null {
-  if (part?.type !== "tool-present_insight") return null;
-  const value = part.output ?? part.result ?? part.input;
+  if (part?.type !== "tool-present_insight" && part?.type !== "data-analyst-insight") return null;
+  const value = part.data ?? part.output ?? part.result ?? part.input;
   return value && typeof value.title === "string" && typeof value.summary === "string" ? value as Insight : null;
 }
 
@@ -156,7 +155,7 @@ export function DatasetAgentChat({ datasetId, datasetName }: { datasetId: string
 
   const startNewChat = () => {
     if (selectedKind === "gemini") {
-      const settings = { apiKey: geminiSettings.apiKey?.trim(), baseURL: geminiSettings.baseURL?.trim(), model: geminiSettings.model?.trim() };
+      const settings = { baseURL: geminiSettings.baseURL?.trim(), model: geminiSettings.model?.trim() };
       if (!settings.baseURL || !settings.model) {
         setSettingsMessage("Enter the Gemini API base URL and model first.");
         return;
@@ -180,9 +179,9 @@ export function DatasetAgentChat({ datasetId, datasetName }: { datasetId: string
       <summary style={{ cursor: "pointer", fontWeight: 600 }}>Model connection · {activeProvider.kind === "gemini" ? `Gemini (${activeProvider.settings.model})` : "Featherless"}</summary>
       <div style={{ display: "grid", gap: 10, marginTop: 12 }}>
         <label>Provider <select value={selectedKind} onChange={(event) => setSelectedKind(event.target.value as ChatProvider["kind"])} style={{ marginLeft: 8, padding: 8 }}><option value="featherless">Featherless</option><option value="gemini">Gemini API</option></select></label>
-        {selectedKind === "gemini" && <><label>Gemini API base URL <input value={geminiSettings.baseURL ?? ""} onChange={(event) => setGeminiSettings((value) => ({ ...value, baseURL: event.target.value }))} style={{ display: "block", width: "100%", boxSizing: "border-box", marginTop: 4, padding: 8 }} /></label><label>Gemini API key override (optional when `GEMINI_API_KEY` is set in Trigger) <input type="password" autoComplete="off" value={geminiSettings.apiKey ?? ""} onChange={(event) => setGeminiSettings((value) => ({ ...value, apiKey: event.target.value }))} placeholder="Paste a rotated Gemini key" style={{ display: "block", width: "100%", boxSizing: "border-box", marginTop: 4, padding: 8 }} /></label><label>Model <input value={geminiSettings.model ?? ""} onChange={(event) => setGeminiSettings((value) => ({ ...value, model: event.target.value }))} style={{ display: "block", width: "100%", boxSizing: "border-box", marginTop: 4, padding: 8 }} /></label></>}
+        {selectedKind === "gemini" && <><label>Gemini API base URL <input value={geminiSettings.baseURL ?? ""} onChange={(event) => setGeminiSettings((value) => ({ ...value, baseURL: event.target.value }))} style={{ display: "block", width: "100%", boxSizing: "border-box", marginTop: 4, padding: 8 }} /></label><label>Model <input value={geminiSettings.model ?? ""} onChange={(event) => setGeminiSettings((value) => ({ ...value, model: event.target.value }))} style={{ display: "block", width: "100%", boxSizing: "border-box", marginTop: 4, padding: 8 }} /></label></>}
         <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}><button type="button" onClick={startNewChat}>{selectedKind === "gemini" ? "Save Gemini settings & start new chat" : "Start new Featherless chat"}</button>{settingsMessage && <small style={{ color: "#475569" }}>{settingsMessage}</small>}</div>
-        <small style={{ color: "#64748b" }}>Prefer `GEMINI_API_KEY` in Trigger for the shared key. A browser key is an optional override and is never committed. Start a new chat after changing provider settings.</small>
+        <small style={{ color: "#64748b" }}>The API key is read only from `GEMINI_API_KEY` in Trigger. This browser stores only the provider, base URL, and model. Start a new chat after changing settings.</small>
       </div>
     </details>
     <DatasetChatSession key={sessionKey} datasetId={datasetId} provider={activeProvider} />
