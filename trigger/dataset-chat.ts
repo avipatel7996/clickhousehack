@@ -74,6 +74,20 @@ function buildTools(context: DatasetContext, datasetId: string) {
       inputSchema: z.object({ sql: z.string().min(8).max(5000) }),
       execute: async ({ sql }) => runQuery(sql),
     }),
+    rank_entities: tool({
+      description: "Rank entities such as players or movies using multiple numeric columns. Use this for top/best/strongest questions instead of ordering by one arbitrary metric. The score normalizes each selected metric to 0..1 before averaging.",
+      inputSchema: z.object({ entityColumn: z.string().min(1), metricColumns: z.array(z.string().min(1)).min(2).max(8), limit: z.number().int().min(1).max(25).default(10) }),
+      execute: async ({ entityColumn, metricColumns, limit }) => {
+        const allowed = new Set(context.columns.map((column) => column.name));
+        if (!allowed.has(entityColumn) || metricColumns.some((column) => !allowed.has(column))) throw new Error("Ranking requested columns that are not in the dataset schema");
+        const quoteIdentifier = (value: string) => `\`${value.replace(/`/g, "")}\``;
+        const bounds = metricColumns.map((column, index) => `min(toFloat64OrNull(${quoteIdentifier(column)})) AS min_${index}, max(toFloat64OrNull(${quoteIdentifier(column)})) AS max_${index}`).join(", ");
+        const components = metricColumns.map((column, index) => `ifNull((toFloat64OrNull(${quoteIdentifier(column)}) - min_${index}) / nullIf(max_${index} - min_${index}, 0), 0)`).join(" + ");
+        const selected = metricColumns.map((column) => quoteIdentifier(column)).join(", ");
+        const sql = `WITH bounds AS (SELECT ${bounds} FROM ${context.table}), scored AS (SELECT ${quoteIdentifier(entityColumn)} AS entity, (${components}) / ${metricColumns.length} AS composite_score, ${selected} FROM ${context.table} CROSS JOIN bounds) SELECT * FROM scored WHERE entity IS NOT NULL ORDER BY composite_score DESC LIMIT ${limit}`;
+        return runQuery(sql);
+      },
+    }),
     present_insight: tool({
       description: "Present a completed data-backed answer as safe structured UI. Call this after using one or more data tools. Only include facts that appeared in tool results.",
       inputSchema: z.object({
@@ -110,7 +124,7 @@ export const datasetChat = chat
       return streamText({
         ...chat.toStreamTextOptions({ tools }),
         model: provider.chat(process.env.FEATHERLESS_MODEL ?? "meta-llama/Meta-Llama-3.1-70B-Instruct"),
-        system: `You are a precise data analyst. You answer questions only with evidence from ClickHouse. Dataset table: ${context.table}. Columns: ${JSON.stringify(context.columns)}. First inspect or search the dataset, then run any required SQL. For people, titles, and names use search_records with spelling variations before concluding there is no match. After evidence is available, call present_insight to create the response UI, then provide a concise final answer. Never invent facts.`,
+        system: `You are a precise data analyst. You answer questions only with evidence from ClickHouse. Dataset table: ${context.table}. Columns: ${JSON.stringify(context.columns)}. First inspect or search the dataset, then run any required SQL. For people, titles, and names use search_records with spelling variations before concluding there is no match. For top/best/strongest/ranking questions, identify the entity column and at least two relevant numeric/stat columns from the schema, then use rank_entities; do not order by one arbitrary metric. After evidence is available, call present_insight to create the response UI, then provide a concise final answer. Never invent facts.`,
         messages,
         abortSignal: signal,
         stopWhen: stepCountIs(8),
