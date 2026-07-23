@@ -39,6 +39,11 @@ export async function POST(request: Request) {
   if (!workspaceId) workspaceId = crypto.randomUUID();
   if (!datasetId) datasetId = crypto.randomUUID();
   const dispatch = await dispatchTask("analyze-dataset", { analysisId, workspaceId, datasetId, question, chartPreference: body.chartPreference ?? "auto" });
+  if (!dispatch.enabled || dispatch.error || !dispatch.runId) {
+    const message = dispatch.error ?? "TRIGGER_SECRET_KEY is missing; no analysis worker was dispatched";
+    if (supabase) await supabase.from("analysis_runs").update({ status: "failed", error_message: message }).eq("id", analysisId);
+    return NextResponse.json({ error: message, analysisId, live: false }, { status: 503 });
+  }
   if (supabase && dispatch.runId) await supabase.from("analysis_runs").update({ trigger_run_id: dispatch.runId }).eq("id", analysisId);
   if (supabase && dispatch.error) await supabase.from("analysis_runs").update({ status: "failed", error_message: dispatch.error }).eq("id", analysisId);
   return NextResponse.json({ status: dispatch.error ? "failed" : "queued", analysisId, workspaceId, triggerRunId: dispatch.runId, live: dispatch.enabled && !dispatch.error, warning: dispatch.error ?? (dispatch.enabled ? undefined : "Trigger.dev is not configured") }, { status: dispatch.error ? 502 : 202 });

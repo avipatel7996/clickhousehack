@@ -47,6 +47,11 @@ export async function POST(request: Request) {
     }
     if (!workspaceId) workspaceId = crypto.randomUUID();
     const dispatch = await dispatchTask("ingest-dataset", { importId, workspaceId, kaggleRef: `${reference.owner}/${reference.slug}${reference.version ? `/versions/${reference.version}` : ""}`, selectedFiles: body.selectedFiles ?? [] });
+    if (!dispatch.enabled || dispatch.error || !dispatch.runId) {
+      const message = dispatch.error ?? "TRIGGER_SECRET_KEY is missing; no ingestion worker was dispatched";
+      await supabase?.from("dataset_imports").update({ status: "failed", error_message: message }).eq("id", importId);
+      return NextResponse.json({ error: message, importId, live: false }, { status: 503 });
+    }
     if (supabase && dispatch.runId) await supabase.from("dataset_imports").update({ trigger_run_id: dispatch.runId }).eq("id", importId);
     return NextResponse.json({ status: "queued", importId, workspaceId, triggerRunId: dispatch.runId, live: dispatch.enabled && !dispatch.error, warning: dispatch.error ?? (dispatch.enabled ? undefined : "Trigger.dev is not configured; running in demo mode.") }, { status: 202 });
   } catch (error) {
