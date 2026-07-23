@@ -1,7 +1,7 @@
 import { chat } from "@trigger.dev/sdk/ai";
 import { createOpenAI } from "@ai-sdk/openai";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
-import { stepCountIs, streamText, tool } from "ai";
+import { stepCountIs, streamText, tool, type PrepareStepFunction } from "ai";
 import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
 import { ClickHouseClient, createClickHouseConfig, validateReadOnlySql } from "../packages/clickhouse/src";
@@ -143,6 +143,11 @@ type AnalystInsight = {
   table: { columns: string[]; rows: Array<Record<string, string | number | boolean | null>> };
   chart?: { type: "bar"; x: string; y: string; data: Array<Record<string, string | number | null>> };
   caveat: string;
+};
+
+type AnalysisPlan = {
+  objective: string;
+  subquestions: string[];
 };
 
 function quoteIdentifier(value: string) { return `\`${value.replace(/`/g, "")}\``; }
@@ -317,6 +322,25 @@ function buildTools(context: DatasetContext, datasetId: string) {
     }, (result) => `ClickHouse returned ${result.rowCount} row${result.rowCount === 1 ? "" : "s"}`);
   };
   return {
+    plan_analysis: tool({
+      description: "Create the minimum evidence plan before any research. Use one sub-question for a simple aggregate or lookup. Use two or three only when resolving separate entities, applying a filter, or combining evidence. For example, two named people require one lookup per person and then an intersection. Never include generic steps such as 'analyze the data' or 'give the answer'.",
+      inputSchema: z.object({
+        objective: z.string().trim().min(3).max(240),
+        subquestions: z.array(z.string().trim().min(3).max(220)).min(1).max(3),
+      }),
+      execute: async (plan) => {
+        const subquestions = [...new Set(plan.subquestions.map((question) => question.trim()))].slice(0, 3);
+        const normalized = { objective: plan.objective.trim(), subquestions } satisfies AnalysisPlan;
+        workflow.status("planning", `Planned ${subquestions.length} evidence check${subquestions.length === 1 ? "" : "s"}`);
+        workflow.event("planning", `Plan ready: ${subquestions.length} focused sub-question${subquestions.length === 1 ? "" : "s"}`, "completed");
+        chat.response.write({
+          type: "data-analysis-plan",
+          id: `analysis-plan-${crypto.randomUUID()}`,
+          data: normalized,
+        } as never);
+        return normalized;
+      },
+    }),
     inspect_dataset: tool({
       description: "Return the stored schema and a small sample for one imported table. The schema for every table is already available in the system context; call this only when an unfamiliar table needs sample values.",
       inputSchema: z.object({ table: z.string().optional() }),
@@ -327,7 +351,7 @@ function buildTools(context: DatasetContext, datasetId: string) {
       },
     }),
     search_records: tool({
-      description: "Search every imported table for a person, title, entity, or phrase using case-insensitive substring matching. Call exactly once for each named entity before making an assumption. The result identifies the searched files and fields. If it returns zero rows, say the dataset has no evidence; never substitute a person from outside knowledge. If it returns multiple candidates, explain the candidate evidence and your selection.",
+      description: "Search every imported table for one person, title, entity, or phrase using case-insensitive substring matching. Call exactly once for each named entity before making an assumption. Do not combine distinct names into one search; resolve each separately, then query their intersection. The result identifies the searched files and fields. If it returns zero rows, say the dataset has no evidence; never substitute a person from outside knowledge. If it returns multiple candidates, explain the candidate evidence and your selection.",
       inputSchema: z.object({ query: z.string().min(1).max(160), limit: z.number().int().min(1).max(20).default(10) }),
       execute: async ({ query, limit }) => {
         const terms = query.toLowerCase().split(/\s+/).filter((term) => term.length > 1).slice(0, 6);
@@ -454,17 +478,33 @@ export const datasetChat = chat
           data: recommendation,
         } as never);
       }
+      const streamOptions = chat.toStreamTextOptions({ tools });
+      const triggerPrepareStep = streamOptions.prepareStep as PrepareStepFunction | undefined;
       return streamText({
-        ...chat.toStreamTextOptions({ tools }),
+        ...streamOptions,
         // Gemini is selected per session; Featherless retains its fast
         // non-reasoning default for sessions that do not opt into Gemini.
         model: resolveChatModel(clientData),
-        system: `You are a precise, fast data analyst for arbitrary imported datasets. Answer only from ClickHouse results. Dataset tables and schemas: ${JSON.stringify(context.tables)}. Follow this evidence workflow on every answer: (1) identify the relevant table and requested constraints from the question; (2) resolve a named person, title, or entity with one search_records call before querying; (3) run a bounded read-only query that applies every supported constraint; (4) compare the result with the original question before answering, and explicitly state unsupported constraints or zero evidence. search_records searches every imported text field using substring matching. If it finds nothing, say what was searched and never infer an identity from outside knowledge. If it finds multiple candidates, state the candidates and the data-backed reason for any selection before continuing. Never repeat an identical tool call. Use rank_entities only for multi-metric rankings and select its table explicitly when necessary. Do not inspect the dataset unless a sample is necessary. Call present_insight only when a table, chart, or cards materially improve the answer. ${recommendation ? "A verified generic rating recommendation table has already been emitted. Do not call tools or emit text; the structured result is the complete answer." : "Give the direct result first and keep ordinary answers under 160 words."} Do not describe hidden reasoning. Never invent facts.`,
+        system: `You are a precise, fast data analyst for arbitrary imported datasets. Answer only from ClickHouse results. Dataset tables and schemas: ${JSON.stringify(context.tables)}. For every non-trivial request, first create a short evidence plan. It must have only the necessary sub-questions: use one for a simple aggregate; add one per distinct named entity or dependent filter; never pad it. Then follow the plan: identify the relevant table and requested constraints; resolve each named person, title, or entity with its own search_records call before querying; run a bounded read-only query that applies every supported constraint; compare the result with the original question before answering, and explicitly state unsupported constraints or zero evidence. search_records searches every imported text field using substring matching. If it finds nothing, say what was searched and never infer an identity from outside knowledge. If it finds multiple candidates, state the candidates and the data-backed reason for any selection before continuing. Never repeat an identical tool call. Use rank_entities only for multi-metric rankings and select its table explicitly when necessary. Do not inspect the dataset unless a sample is necessary. Call present_insight only when a table, chart, or cards materially improve the answer. ${recommendation ? "A verified generic rating recommendation table has already been emitted. Do not call tools or emit text; the structured result is the complete answer." : "Give the direct result first and keep ordinary answers under 160 words."} Do not describe hidden reasoning. Never invent facts.`,
         messages,
         abortSignal: signal,
         maxOutputTokens: recommendation ? 100 : 240,
         temperature: 0,
-        ...(recommendation ? { toolChoice: "none" as const, stopWhen: stepCountIs(1) } : { stopWhen: stepCountIs(3) }),
+        ...(recommendation ? {
+          toolChoice: "none" as const,
+          stopWhen: stepCountIs(1),
+        } : {
+          // Trigger's own prepareStep (compaction / injections) still runs;
+          // the first model step is then constrained to the visible plan.
+          prepareStep: async (options) => {
+            const triggerStep = await triggerPrepareStep?.(options);
+            if (options.stepNumber === 0) {
+              return { ...triggerStep, activeTools: ["plan_analysis"], toolChoice: { type: "tool", toolName: "plan_analysis" } };
+            }
+            return triggerStep;
+          },
+          stopWhen: stepCountIs(5),
+        }),
       });
     },
   });

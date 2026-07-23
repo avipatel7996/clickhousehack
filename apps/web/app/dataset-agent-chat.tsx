@@ -22,6 +22,7 @@ type EntityEvidence = {
   searched: Array<{ source: string; fields: string[] }>;
   conclusion: string;
 };
+type AnalysisPlan = { objective: string; subquestions: string[] };
 type ChatActivity = Pick<AgentStatus, "stage" | "message">;
 type GeminiSettings = { baseURL?: string; model?: string };
 type ChatProvider = { kind: "featherless" } | { kind: "gemini"; settings: GeminiSettings };
@@ -63,6 +64,20 @@ function entityEvidenceFromPart(part: any): EntityEvidence | null {
   if (part?.type !== "data-entity-evidence") return null;
   const value = part.data;
   return value && typeof value.query === "string" && Array.isArray(value.candidates) && Array.isArray(value.searched) && typeof value.conclusion === "string" ? value as EntityEvidence : null;
+}
+
+function analysisPlanFromPart(part: any): AnalysisPlan | null {
+  if (part?.type !== "data-analysis-plan") return null;
+  const value = part.data;
+  return value && typeof value.objective === "string" && Array.isArray(value.subquestions) ? value as AnalysisPlan : null;
+}
+
+function AnalysisPlanView({ plan }: { plan: AnalysisPlan }) {
+  return <aside style={{ marginTop: 10, padding: 14, border: "1px solid #ddd6fe", borderRadius: 10, background: "#f5f3ff" }}>
+    <strong>Analysis plan</strong>
+    <p style={{ margin: "6px 0", color: "#334155" }}>{plan.objective}</p>
+    <ol style={{ margin: "8px 0 0", paddingLeft: 22 }}>{plan.subquestions.map((question, index) => <li key={index} style={{ marginTop: 4 }}>{question}</li>)}</ol>
+  </aside>;
 }
 
 function EntityEvidenceView({ evidence }: { evidence: EntityEvidence }) {
@@ -157,6 +172,8 @@ function DatasetChatSession({ datasetId, provider }: { datasetId: string; provid
         if (insight) return <InsightView key={index} insight={insight} />;
         const evidence = entityEvidenceFromPart(part);
         if (evidence) return <EntityEvidenceView key={index} evidence={evidence} />;
+        const plan = analysisPlanFromPart(part);
+        if (plan) return <AnalysisPlanView key={index} plan={plan} />;
         return null;
       })}{message.role === "assistant" && <WorkTrace parts={message.parts ?? []} />}</div>;
     })}</div>
