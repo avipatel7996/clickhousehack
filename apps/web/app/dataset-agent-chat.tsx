@@ -23,12 +23,14 @@ function insightFromPart(part: any): Insight | null {
 }
 
 function InsightView({ insight }: { insight: Insight }) {
+  const chart = insight.chart;
+  const max = chart?.y ? Math.max(1, ...chart.data.map((row) => Number(row[chart.y!] ?? 0)).filter(Number.isFinite)) : 1;
   return <article style={{ marginTop: 10, padding: 16, border: "1px solid #cbd5e1", borderRadius: 12, background: "#f8fafc" }}>
     <h3 style={{ margin: 0 }}>{insight.title}</h3>
     <p>{insight.summary}</p>
     {insight.cards?.length ? <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: 10 }}>{insight.cards.map((card, index) => <div key={index} style={{ background: "white", borderRadius: 8, padding: 12, border: "1px solid #e2e8f0" }}><small>{card.label}</small><strong style={{ display: "block", fontSize: 20 }}>{card.value}</strong>{card.detail && <small>{card.detail}</small>}</div>)}</div> : null}
     {insight.table?.rows?.length ? <div style={{ overflowX: "auto", marginTop: 12 }}><table style={{ borderCollapse: "collapse", width: "100%" }}><thead><tr>{insight.table.columns.map((column) => <th key={column} style={{ textAlign: "left", borderBottom: "1px solid #cbd5e1", padding: 8 }}>{column}</th>)}</tr></thead><tbody>{insight.table.rows.map((row, rowIndex) => <tr key={rowIndex}>{insight.table!.columns.map((column) => <td key={column} style={{ borderBottom: "1px solid #e2e8f0", padding: 8 }}>{String(row[column] ?? "—")}</td>)}</tr>)}</tbody></table></div> : null}
-    {insight.chart?.type && insight.chart.type !== "none" && insight.chart.data.length ? <pre style={{ overflowX: "auto", fontSize: 12, background: "#0f172a", color: "#e2e8f0", padding: 12, borderRadius: 8 }}>{JSON.stringify(insight.chart, null, 2)}</pre> : null}
+    {chart?.type && chart.type !== "none" && chart.data.length && chart.x && chart.y ? <div style={{ display: "grid", gap: 8, marginTop: 14 }}>{chart.data.map((row, index) => { const value = Number(row[chart.y!] ?? 0); return <div key={index} style={{ display: "grid", gridTemplateColumns: "minmax(90px, 1fr) 3fr auto", gap: 8, alignItems: "center" }}><small style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{String(row[chart.x!] ?? "—")}</small><div style={{ height: 10, borderRadius: 99, background: "#e2e8f0", overflow: "hidden" }}><div style={{ width: `${Math.max(0, Math.min(100, (value / max) * 100))}%`, height: "100%", background: "linear-gradient(90deg,#2563eb,#7c3aed)" }} /></div><small>{String(row[chart.y!] ?? "—")}</small></div>; })}</div> : null}
     {insight.caveat && <small style={{ color: "#64748b" }}>{insight.caveat}</small>}
   </article>;
 }
