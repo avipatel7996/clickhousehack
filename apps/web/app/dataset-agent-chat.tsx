@@ -69,7 +69,12 @@ function entityEvidenceFromPart(part: any): EntityEvidence | null {
 function analysisPlanFromPart(part: any): AnalysisPlan | null {
   if (part?.type !== "data-analysis-plan") return null;
   const value = part.data;
-  return value && typeof value.objective === "string" && Array.isArray(value.subquestions) ? value as AnalysisPlan : null;
+  if (!value || typeof value.objective !== "string" || !Array.isArray(value.subquestions)) return null;
+  // A single generic sentence adds no information and made simple requests
+  // look like an unfinished workflow. Keep the panel for genuine dependency
+  // plans only.
+  if (value.subquestions.length === 1 && /^run one bounded clickhouse query that answers the request/i.test(String(value.subquestions[0] ?? ""))) return null;
+  return value as AnalysisPlan;
 }
 
 function AnalysisPlanView({ plan }: { plan: AnalysisPlan }) {

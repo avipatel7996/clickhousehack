@@ -328,6 +328,55 @@ function humanizeColumn(name: string) {
   return name.replace(/[_-]+/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
+/**
+ * A raw row preview is a database operation, not an analytical problem. Do
+ * not spend a model turn planning it: use one verified ClickHouse query and
+ * return its rows to the structured renderer.
+ */
+function previewLimit(question: string) {
+  const text = question.toLowerCase();
+  const asksForRows = /\b(rows?|records?|entries|table)\b/.test(text);
+  const asksForPreview = /\b(first|sample|preview)\b/.test(text);
+  const hasConstraints = /\b(where|with|whose|after|before|between|group|rank|order|sort|filter)\b/.test(text);
+  if (!asksForRows || !asksForPreview || hasConstraints) return null;
+  const count = text.match(/\b(?:first|sample|preview)\s+(\d{1,2})\b/)?.[1];
+  return Math.min(50, Math.max(1, Number(count ?? 10)));
+}
+
+function displayCell(value: unknown): string | number | boolean | null {
+  if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") return value;
+  if (value === undefined) return null;
+  return JSON.stringify(value);
+}
+
+async function prepareTablePreview(context: DatasetContext, question: string): Promise<AnalystInsight | null> {
+  const limit = previewLimit(question);
+  if (!limit) return null;
+  const source = context.tables[0];
+  if (!source) return null;
+  const workflow = createWorkflowReporter();
+  workflow.status("querying", `Fetching the first ${limit} rows`);
+  workflow.event("planning", "Classified this as a direct table preview", "completed");
+  const sql = `SELECT * FROM ${source.table} LIMIT ${limit}`;
+  const clickhouse = new ClickHouseClient(createClickHouseConfig());
+  const result = await workflow.activity("querying", `Running ${source.sourcePath ?? source.table} preview query`, async () => {
+    const verified = validateReadOnlySql(sql, [source.table]);
+    if (!verified.ok) throw new Error(verified.error);
+    return clickhouse.query<Record<string, unknown>>(sql, { timeoutMs: 15_000 });
+  }, (value) => `ClickHouse returned ${value.rows.length} row${value.rows.length === 1 ? "" : "s"}`);
+  const columns = result.rows.length ? Object.keys(result.rows[0]) : source.columns.map((column) => column.name);
+  const rows = result.rows.map((row) => Object.fromEntries(columns.map((column) => [column, displayCell(row[column])]))) as Array<Record<string, string | number | boolean | null>>;
+  workflow.event("answering", "Rendered the raw table rows", "completed");
+  workflow.status("answering", "Streaming the table preview");
+  return {
+    title: `First ${rows.length} rows`,
+    summary: rows.length ? `Raw rows from ${source.sourcePath ?? source.table}.` : `No rows were returned from ${source.sourcePath ?? source.table}.`,
+    cards: [],
+    table: { columns, rows },
+    caveat: "This is an unfiltered table preview; ClickHouse does not guarantee a semantic order unless you request one.",
+  };
+}
+
 async function prepareUnfilteredRanking(context: DatasetContext, question: string): Promise<AnalystInsight | null> {
   if (!isUnfilteredRankingRequest(question)) return null;
   const terms = questionTerms(question);
@@ -626,6 +675,15 @@ export const datasetChat = chat
       if (!clientData) throw new Error("Dataset context is required");
       const context = datasetContext.get();
       const question = latestUserQuestion(messages);
+      const preview = question ? await prepareTablePreview(context, question) : null;
+      if (preview) {
+        chat.response.write({
+          type: "data-analyst-insight",
+          id: `analyst-table-preview-${crypto.randomUUID()}`,
+          data: preview,
+        } as never);
+        return;
+      }
       const model = resolveChatModel(clientData);
       const planner = question ? createWorkflowReporter() : undefined;
       const plan = question && planner ? await planner.activity(
