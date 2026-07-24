@@ -11,7 +11,7 @@ export type AgentDatasetTable = {
 
 export type SqlAgentProvider =
   | { kind: "gemini"; apiKey: string; model: string }
-  | { kind: "openai-compatible"; apiKey: string; model: string; baseURL: string };
+  | { kind: "openai-compatible" | "bedrock"; apiKey: string; model: string; baseURL: string };
 
 export type ExecutedSqlStep = {
   sql: string;
@@ -54,8 +54,9 @@ function createModel(provider: SqlAgentProvider) {
   return new ChatOpenAI({
     apiKey: provider.apiKey,
     model: provider.model,
-    temperature: 0,
-    maxTokens: 900,
+    // Current Bedrock Claude models reject sampling parameters. Leaving
+    // these unset keeps one OpenAI-compatible transport for Kimi and Claude.
+    ...(provider.kind === "bedrock" ? {} : { temperature: 0, maxTokens: 900 }),
     configuration: { baseURL: provider.baseURL },
   });
 }

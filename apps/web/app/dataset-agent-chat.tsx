@@ -25,12 +25,20 @@ type EntityEvidence = {
 type AnalysisPlan = { objective: string; subquestions: string[]; outcome?: "query" | "not_possible" | "clarification"; limitation?: string; strategy?: string; metrics?: string[] };
 type ChatActivity = Pick<AgentStatus, "stage" | "message">;
 type GeminiSettings = { baseURL?: string; model?: string };
-type ChatProvider = { kind: "featherless" } | { kind: "gemini"; settings: GeminiSettings };
+type ProviderKind = "bedrock-kimi" | "bedrock-claude-opus" | "bedrock-claude-sonnet" | "featherless" | "gemini";
+type ChatProvider = { kind: Exclude<ProviderKind, "gemini"> } | { kind: "gemini"; settings: GeminiSettings };
 
 const providerStorageKey = "clickhouse-analyst.gemini-settings";
 const defaultGeminiSettings: GeminiSettings = {
   baseURL: "https://generativelanguage.googleapis.com/v1beta",
   model: "gemini-flash-latest",
+};
+const providerLabel: Record<ProviderKind, string> = {
+  "bedrock-kimi": "Amazon Bedrock · Kimi K2.5",
+  "bedrock-claude-opus": "Amazon Bedrock · Claude Opus 4.7",
+  "bedrock-claude-sonnet": "Amazon Bedrock · Claude Sonnet 5",
+  featherless: "Featherless",
+  gemini: "Gemini API",
 };
 
 function formatTime(value: string) {
@@ -146,9 +154,9 @@ function DatasetChatSession({ datasetId, provider }: { datasetId: string; provid
     task: "dataset-chat",
     clientData: provider.kind === "gemini"
       ? { datasetId, provider: "gemini" as const, gemini: provider.settings }
-      : { datasetId, provider: "featherless" as const },
+      : { datasetId, provider: provider.kind },
     accessToken: ({ chatId }) => mintDatasetChatToken(chatId),
-    startSession: ({ chatId, clientData }) => startDatasetChat({ chatId, clientData: clientData as { datasetId: string; provider?: "featherless" | "gemini"; gemini?: GeminiSettings } }),
+    startSession: ({ chatId, clientData }) => startDatasetChat({ chatId, clientData: clientData as { datasetId: string; provider?: ProviderKind; gemini?: GeminiSettings } }),
     onEvent: (event) => {
       if (event.type === "message-sent") setActivity({ stage: "planning", message: "Question received — preparing the analyst" });
       if (event.type === "stream-connected") setActivity({ stage: "planning", message: "Analyst is checking the dataset" });
@@ -194,20 +202,23 @@ function DatasetChatSession({ datasetId, provider }: { datasetId: string; provid
 }
 
 export function DatasetAgentChat({ datasetId, datasetName }: { datasetId: string; datasetName: string }) {
-  const [selectedKind, setSelectedKind] = useState<ChatProvider["kind"]>("featherless");
+  const [selectedKind, setSelectedKind] = useState<ProviderKind>("bedrock-kimi");
   const [geminiSettings, setGeminiSettings] = useState<GeminiSettings>(defaultGeminiSettings);
-  const [activeProvider, setActiveProvider] = useState<ChatProvider>({ kind: "featherless" });
+  const [activeProvider, setActiveProvider] = useState<ChatProvider>({ kind: "bedrock-kimi" });
   const [sessionKey, setSessionKey] = useState(0);
   const [settingsMessage, setSettingsMessage] = useState("");
 
   useEffect(() => {
     try {
-      const saved = JSON.parse(window.localStorage.getItem(providerStorageKey) ?? "") as { kind?: ChatProvider["kind"]; settings?: GeminiSettings };
+      const saved = JSON.parse(window.localStorage.getItem(providerStorageKey) ?? "") as { kind?: ProviderKind; settings?: GeminiSettings };
       if (saved.kind === "gemini") {
         setSelectedKind("gemini");
         const settings = saved.settings ?? defaultGeminiSettings;
         setGeminiSettings(settings);
         setActiveProvider({ kind: "gemini", settings });
+      } else if (saved.kind && saved.kind in providerLabel) {
+        setSelectedKind(saved.kind);
+        setActiveProvider({ kind: saved.kind });
       }
     } catch {
       // A malformed local preference should never prevent the chat from loading.
@@ -226,9 +237,9 @@ export function DatasetAgentChat({ datasetId, datasetName }: { datasetId: string
       setActiveProvider({ kind: "gemini", settings });
       setSettingsMessage("Gemini settings saved on this device. New chat ready.");
     } else {
-      window.localStorage.setItem(providerStorageKey, JSON.stringify({ kind: "featherless", settings: geminiSettings }));
-      setActiveProvider({ kind: "featherless" });
-      setSettingsMessage("Featherless selected. New chat ready.");
+      window.localStorage.setItem(providerStorageKey, JSON.stringify({ kind: selectedKind, settings: geminiSettings }));
+      setActiveProvider({ kind: selectedKind });
+      setSettingsMessage(`${providerLabel[selectedKind]} selected. New chat ready.`);
     }
     setSessionKey((value) => value + 1);
   };
@@ -237,12 +248,12 @@ export function DatasetAgentChat({ datasetId, datasetName }: { datasetId: string
     <h2 style={{ marginTop: 0 }}>Ask {datasetName}</h2>
     <p style={{ color: "#64748b" }}>The agent queries ClickHouse, then streams an evidence-backed answer.</p>
     <details style={{ margin: "14px 0", padding: "10px 12px", border: "1px solid #e2e8f0", borderRadius: 8, background: "#f8fafc" }}>
-      <summary style={{ cursor: "pointer", fontWeight: 600 }}>Model connection · {activeProvider.kind === "gemini" ? `Gemini (${activeProvider.settings.model})` : "Featherless"}</summary>
+      <summary style={{ cursor: "pointer", fontWeight: 600 }}>Model connection · {activeProvider.kind === "gemini" ? `Gemini (${activeProvider.settings.model})` : providerLabel[activeProvider.kind]}</summary>
       <div style={{ display: "grid", gap: 10, marginTop: 12 }}>
-        <label>Provider <select value={selectedKind} onChange={(event) => setSelectedKind(event.target.value as ChatProvider["kind"])} style={{ marginLeft: 8, padding: 8 }}><option value="featherless">Featherless</option><option value="gemini">Gemini API</option></select></label>
+        <label>Provider <select value={selectedKind} onChange={(event) => setSelectedKind(event.target.value as ProviderKind)} style={{ marginLeft: 8, padding: 8 }}><option value="bedrock-kimi">Amazon Bedrock · Kimi K2.5</option><option value="bedrock-claude-opus">Amazon Bedrock · Claude Opus 4.7</option><option value="bedrock-claude-sonnet">Amazon Bedrock · Claude Sonnet 5</option><option value="featherless">Featherless</option><option value="gemini">Gemini API</option></select></label>
         {selectedKind === "gemini" && <><label>Gemini API base URL <input value={geminiSettings.baseURL ?? ""} onChange={(event) => setGeminiSettings((value) => ({ ...value, baseURL: event.target.value }))} style={{ display: "block", width: "100%", boxSizing: "border-box", marginTop: 4, padding: 8 }} /></label><label>Model <input value={geminiSettings.model ?? ""} onChange={(event) => setGeminiSettings((value) => ({ ...value, model: event.target.value }))} style={{ display: "block", width: "100%", boxSizing: "border-box", marginTop: 4, padding: 8 }} /></label></>}
-        <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}><button type="button" onClick={startNewChat}>{selectedKind === "gemini" ? "Save Gemini settings & start new chat" : "Start new Featherless chat"}</button>{settingsMessage && <small style={{ color: "#475569" }}>{settingsMessage}</small>}</div>
-        <small style={{ color: "#64748b" }}>The API key is read only from `GEMINI_API_KEY` in Trigger. This browser stores only the provider, base URL, and model. Start a new chat after changing settings.</small>
+        <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}><button type="button" onClick={startNewChat}>{selectedKind === "gemini" ? "Save Gemini settings & start new chat" : `Start ${providerLabel[selectedKind]} chat`}</button>{settingsMessage && <small style={{ color: "#475569" }}>{settingsMessage}</small>}</div>
+        <small style={{ color: "#64748b" }}>Keys stay in Trigger: Bedrock uses `BEDROCK_API_KEY`; Gemini uses `GEMINI_API_KEY`. This browser stores only provider/model preferences.</small>
       </div>
     </details>
     <DatasetChatSession key={sessionKey} datasetId={datasetId} provider={activeProvider} />

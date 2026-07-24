@@ -9,7 +9,7 @@ import { runLangChainSqlAgent, type ExecutedSqlStep, type SqlAgentPresentation, 
 
 const clientDataSchema = z.object({
   datasetId: z.string().uuid(),
-  provider: z.enum(["featherless", "gemini"]).default("featherless"),
+  provider: z.enum(["featherless", "gemini", "bedrock-kimi", "bedrock-claude-opus", "bedrock-claude-sonnet"]).default("bedrock-kimi"),
   gemini: z.object({
     baseURL: z.string().trim().url().max(500).optional(),
     model: z.string().trim().max(160).optional(),
@@ -58,6 +58,22 @@ function resolveSqlAgentProvider(clientData: ChatClientData): SqlAgentProvider {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) throw new Error("Set GEMINI_API_KEY in Trigger.dev before selecting Gemini");
     return { kind: "gemini", apiKey, model: clientData.gemini?.model || process.env.GEMINI_MODEL || "gemini-flash-latest" };
+  }
+  if (clientData.provider.startsWith("bedrock-")) {
+    const apiKey = process.env.BEDROCK_API_KEY;
+    if (!apiKey) throw new Error("BEDROCK_API_KEY is required for Amazon Bedrock models");
+    const model = clientData.provider === "bedrock-kimi"
+      ? "moonshotai.kimi-k2.5"
+      : clientData.provider === "bedrock-claude-opus"
+        ? "anthropic.claude-opus-4-7"
+        : "anthropic.claude-sonnet-5";
+    const region = process.env.BEDROCK_REGION ?? "us-east-1";
+    return {
+      kind: "bedrock",
+      apiKey,
+      model,
+      baseURL: process.env.BEDROCK_BASE_URL ?? `https://bedrock-mantle.${region}.api.aws/v1`,
+    };
   }
   const apiKey = process.env.FEATHERLESS_API_KEY;
   if (!apiKey) throw new Error("FEATHERLESS_API_KEY is required");

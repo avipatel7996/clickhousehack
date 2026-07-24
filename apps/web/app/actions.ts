@@ -7,7 +7,7 @@ import { ensureWorkspace, getAuthenticatedUser, getSupabaseServerClient } from "
 const startSession = chat.createStartSessionAction("dataset-chat");
 
 type GeminiClientSettings = { baseURL?: string; model?: string };
-type DatasetChatClientData = { datasetId: string; provider?: "featherless" | "gemini"; gemini?: GeminiClientSettings };
+type DatasetChatClientData = { datasetId: string; provider?: "featherless" | "gemini" | "bedrock-kimi" | "bedrock-claude-opus" | "bedrock-claude-sonnet"; gemini?: GeminiClientSettings };
 
 /** Authorizes a browser session against the selected workspace before minting a session token. */
 export async function startDatasetChat(params: { chatId: string; clientData: DatasetChatClientData }) {
