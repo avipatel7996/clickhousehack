@@ -192,21 +192,18 @@ function DatasetChatSession({ datasetId, provider }: { datasetId: string; provid
 }
 
 export function DatasetAgentChat({ datasetId, datasetName }: { datasetId: string; datasetName: string }) {
-  const [selectedKind, setSelectedKind] = useState<ChatProvider["kind"]>("featherless");
+  const [selectedKind, setSelectedKind] = useState<ChatProvider["kind"]>("gemini");
   const [geminiSettings, setGeminiSettings] = useState<GeminiSettings>(defaultGeminiSettings);
-  const [activeProvider, setActiveProvider] = useState<ChatProvider>({ kind: "featherless" });
+  const [activeProvider, setActiveProvider] = useState<ChatProvider>({ kind: "gemini", settings: defaultGeminiSettings });
   const [sessionKey, setSessionKey] = useState(0);
   const [settingsMessage, setSettingsMessage] = useState("");
 
   useEffect(() => {
     try {
       const saved = JSON.parse(window.localStorage.getItem(providerStorageKey) ?? "") as { kind?: ChatProvider["kind"]; settings?: GeminiSettings };
-      if (saved.kind === "gemini") {
-        setSelectedKind("gemini");
-        const settings = saved.settings ?? defaultGeminiSettings;
-        setGeminiSettings(settings);
-        setActiveProvider({ kind: "gemini", settings });
-      }
+      const settings = saved.settings ?? defaultGeminiSettings;
+      setGeminiSettings(settings);
+      if (saved.kind === "gemini") setActiveProvider({ kind: "gemini", settings });
     } catch {
       // A malformed local preference should never prevent the chat from loading.
     }

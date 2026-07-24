@@ -5,6 +5,7 @@ import { generateObject, stepCountIs, streamText, tool, type LanguageModel } fro
 import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
 import { ClickHouseClient, createClickHouseConfig, validateReadOnlySql } from "../packages/clickhouse/src";
+import { runLangChainSqlAgent, type ExecutedSqlStep, type SqlAgentPresentation, type SqlAgentProvider } from "../packages/analysis/src/langchain-sql-agent";
 
 const clientDataSchema = z.object({
   datasetId: z.string().uuid(),
@@ -47,6 +48,22 @@ function resolveChatModel(clientData: ChatClientData) {
   if (!apiKey) throw new Error("FEATHERLESS_API_KEY is required");
   const provider = createOpenAI({ apiKey, baseURL: process.env.FEATHERLESS_BASE_URL ?? "https://api.featherless.ai/v1" });
   return provider.chat(process.env.FEATHERLESS_INTERACTIVE_MODEL ?? "Qwen/Qwen2.5-7B-Instruct");
+}
+
+function resolveSqlAgentProvider(clientData: ChatClientData): SqlAgentProvider {
+  if (clientData.provider === "gemini") {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) throw new Error("Set GEMINI_API_KEY in Trigger.dev before selecting Gemini");
+    return { kind: "gemini", apiKey, model: clientData.gemini?.model || process.env.GEMINI_MODEL || "gemini-flash-latest" };
+  }
+  const apiKey = process.env.FEATHERLESS_API_KEY;
+  if (!apiKey) throw new Error("FEATHERLESS_API_KEY is required");
+  return {
+    kind: "openai-compatible",
+    apiKey,
+    model: process.env.FEATHERLESS_INTERACTIVE_MODEL ?? process.env.FEATHERLESS_MODEL ?? "Qwen/Qwen2.5-7B-Instruct",
+    baseURL: process.env.FEATHERLESS_BASE_URL ?? "https://api.featherless.ai/v1",
+  };
 }
 
 function schemaCacheFromManifest(manifest: unknown, tableNames: string[]): DatasetTable[] {
@@ -512,6 +529,29 @@ function planInsight(context: DatasetContext, plan: AnalysisPlan, completed: Exe
   };
 }
 
+function sqlAgentInsight(context: DatasetContext, presentation: SqlAgentPresentation, completed: ExecutedSqlStep[]): AnalystInsight {
+  const final = completed.at(-1);
+  if (!final) {
+    return {
+      title: presentation.title,
+      summary: presentation.summary,
+      cards: [],
+      table: { columns: ["Status"], rows: [{ Status: "No ClickHouse query was executed" }] },
+      caveat: presentation.caveat ?? "The agent did not infer an answer outside the imported data.",
+    };
+  }
+  const source = final.tables.map((table) => context.tables.find((candidate) => candidate.table === table)?.sourcePath ?? table).join(", ");
+  const columns = final.rows.length ? Object.keys(final.rows[0]) : [];
+  const rows = final.rows.slice(0, 20).map((row) => Object.fromEntries(columns.map((column) => [column, displayQueryValue(row[column])]))) as Array<Record<string, string | number | boolean | null>>;
+  return {
+    title: presentation.title,
+    summary: presentation.summary,
+    cards: [{ label: "Final rows", value: String(final.rowCount) }, { label: "SQL steps", value: String(completed.length) }],
+    table: { columns, rows },
+    caveat: presentation.caveat ?? `Source: ${source || "imported dataset"}. The table is rendered directly from the final verified ClickHouse query.`,
+  };
+}
+
 function buildTools(context: DatasetContext, datasetId: string) {
   const clickhouse = new ClickHouseClient(createClickHouseConfig());
   const workflow = createWorkflowReporter();
@@ -629,7 +669,6 @@ export const datasetChat = chat
       if (!clientData) throw new Error("Dataset context is required");
       datasetContext.init(await resolveDataset(clientData.datasetId));
     },
-    tools: async () => buildTools(datasetContext.get(), datasetContext.datasetId),
     onTurnStart: async ({ writer }) => {
       writer.write({
         type: "data-agent-status",
@@ -643,44 +682,47 @@ export const datasetChat = chat
       const context = datasetContext.get();
       const question = latestUserQuestion(messages);
       if (!question) throw new Error("A question is required");
-      const model = resolveChatModel(clientData);
-      const planner = createWorkflowReporter();
-      const plan = await planner.activity(
-        "planning",
-        "Writing an executable ClickHouse plan",
-        () => createAnalysisPlan(model, question, context),
-        (value) => value.outcome === "query"
-          ? `Created ${value.queries.length} executable SQL step${value.queries.length === 1 ? "" : "s"}`
-          : "Determined that the imported schema cannot answer this request",
-      );
-      chat.response.write({
-        type: "data-analysis-plan",
-        id: `analysis-plan-${crypto.randomUUID()}`,
-        data: { objective: plan.objective, subquestions: plan.queries.map((step) => step.question), outcome: plan.outcome, limitation: plan.limitation },
-      } as never);
-      if (plan.outcome !== "query" || !plan.queries.length) {
-        chat.response.write({
-          type: "data-analyst-insight",
-          id: `analyst-limitation-${crypto.randomUUID()}`,
-          data: planInsight(context, plan, []),
-        } as never);
-        return;
-      }
+      const workflow = createWorkflowReporter();
+      workflow.status("planning", "Connecting the SQL agent to the imported schema");
+      workflow.event("planning", "SQL agent received the cached table schema", "completed");
       try {
-        const completed = await executeSqlPlan(context, plan);
+        const result = await runLangChainSqlAgent({
+          question,
+          tables: context.tables,
+          provider: resolveSqlAgentProvider(clientData),
+          executeSql: async (sql) => {
+            workflow.status("querying", "Validating and executing a ClickHouse query");
+            workflow.event("querying", "SQL agent requested a read-only ClickHouse query", "started");
+            const verified = validateReadOnlySql(sql, context.tables.map((table) => table.table));
+            if (!verified.ok) throw new Error(verified.error);
+            const response = await new ClickHouseClient(createClickHouseConfig()).query<Record<string, unknown>>(sql, { timeoutMs: 15_000 });
+            return { rows: response.rows, tables: verified.tables };
+          },
+          onQuery: (step) => {
+            workflow.event("querying", `ClickHouse returned ${step.rowCount} row${step.rowCount === 1 ? "" : "s"}`, "completed");
+            chat.response.write({
+              type: "data-sql-step",
+              id: `sql-step-${crypto.randomUUID()}`,
+              data: step,
+            } as never);
+          },
+        });
+        workflow.event("answering", "Rendered the final verified query result", "completed");
+        workflow.status("answering", "Streaming the verified result");
         chat.response.write({
           type: "data-analyst-insight",
           id: `analyst-insight-${crypto.randomUUID()}`,
-          data: planInsight(context, plan, completed),
+          data: sqlAgentInsight(context, result.presentation, result.executed),
         } as never);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        workflow.event("error", "SQL agent could not complete the request", "failed");
         chat.response.write({
           type: "data-analyst-insight",
           id: `analyst-query-error-${crypto.randomUUID()}`,
           data: {
-            title: "The SQL plan could not be executed",
-            summary: "The agent produced a query that ClickHouse rejected, so no answer was inferred.",
+            title: "The SQL agent could not complete the request",
+            summary: "No answer was inferred because the agent did not complete a valid ClickHouse workflow.",
             cards: [],
             table: { columns: ["Status", "Detail"], rows: [{ Status: "Query failed", Detail: message }] },
             caveat: "The visible SQL step is retained for diagnosis and correction.",
