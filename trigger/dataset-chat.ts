@@ -24,6 +24,9 @@ type DatasetContext = {
   datasetId: string;
   version: string;
   tables: DatasetTable[];
+  sourceUrl?: string;
+  canonicalRef?: string;
+  license?: string;
 };
 
 const datasetContext = chat.local<DatasetContext>({ id: "dataset-context" });
@@ -82,7 +85,7 @@ async function resolveDataset(datasetId: string): Promise<DatasetContext> {
   const supabase = serviceSupabase();
   const { data, error } = await supabase
     .from("dataset_imports")
-    .select("physical_tables,source_version,source_manifest,status")
+    .select("physical_tables,source_version,source_manifest,source_url,canonical_ref,license,status")
     .eq("id", datasetId)
     .maybeSingle();
   if (error) throw error;
@@ -105,7 +108,14 @@ async function resolveDataset(datasetId: string): Promise<DatasetContext> {
       return { table, columns, ...(typeof path === "string" ? { sourcePath: path } : {}) };
     });
   }
-  return { datasetId, version: String(data.source_version ?? "unknown"), tables };
+  return {
+    datasetId,
+    version: String(data.source_version ?? "unknown"),
+    tables,
+    ...(typeof data.source_url === "string" ? { sourceUrl: data.source_url } : {}),
+    ...(typeof data.canonical_ref === "string" ? { canonicalRef: data.canonical_ref } : {}),
+    ...(typeof data.license === "string" ? { license: data.license } : {}),
+  };
 }
 
 function quote(value: string) { return `'${value.replace(/'/g, "''")}'`; }
@@ -529,14 +539,15 @@ function planInsight(context: DatasetContext, plan: AnalysisPlan, completed: Exe
   };
 }
 
-function sqlAgentInsight(context: DatasetContext, presentation: SqlAgentPresentation, completed: ExecutedSqlStep[]): AnalystInsight {
+function sqlAgentInsight(context: DatasetContext, presentation: SqlAgentPresentation, completed: ExecutedSqlStep[], plan?: { possible: boolean; needsClarification: boolean; clarifyingQuestion?: string }): AnalystInsight {
   const final = completed.at(-1);
   if (!final) {
+    const clarification = plan?.needsClarification ? plan.clarifyingQuestion : undefined;
     return {
-      title: presentation.title,
-      summary: presentation.summary,
+      title: clarification ? "One clarification is needed" : presentation.title,
+      summary: clarification ?? presentation.summary,
       cards: [],
-      table: { columns: ["Status"], rows: [{ Status: "No ClickHouse query was executed" }] },
+      table: { columns: ["Status"], rows: [{ Status: clarification ? "Waiting for your choice" : "No ClickHouse query was executed" }] },
       caveat: presentation.caveat ?? "The agent did not infer an answer outside the imported data.",
     };
   }
@@ -689,7 +700,17 @@ export const datasetChat = chat
         const result = await runLangChainSqlAgent({
           question,
           tables: context.tables,
+          datasetDescription: [context.canonicalRef, context.sourceUrl, context.license].filter(Boolean).join(" · "),
           provider: resolveSqlAgentProvider(clientData),
+          onPlan: (plan) => {
+            workflow.status("planning", "The SQL agent selected metrics and evidence steps");
+            workflow.event("planning", `Planned ${plan.subquestions.length} evidence step${plan.subquestions.length === 1 ? "" : "s"}`, "completed");
+            chat.response.write({
+              type: "data-analysis-plan",
+              id: `analysis-plan-${crypto.randomUUID()}`,
+              data: { objective: plan.objective, subquestions: plan.subquestions, outcome: plan.needsClarification ? "clarification" : plan.possible ? "query" : "not_possible", limitation: plan.clarifyingQuestion, strategy: plan.strategy, metrics: plan.metrics },
+            } as never);
+          },
           executeSql: async (sql) => {
             workflow.status("querying", "Validating and executing a ClickHouse query");
             workflow.event("querying", "SQL agent requested a read-only ClickHouse query", "started");
@@ -712,7 +733,7 @@ export const datasetChat = chat
         chat.response.write({
           type: "data-analyst-insight",
           id: `analyst-insight-${crypto.randomUUID()}`,
-          data: sqlAgentInsight(context, result.presentation, result.executed),
+          data: sqlAgentInsight(context, result.presentation, result.executed, result.plan),
         } as never);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);

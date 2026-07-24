@@ -22,7 +22,7 @@ type EntityEvidence = {
   searched: Array<{ source: string; fields: string[] }>;
   conclusion: string;
 };
-type AnalysisPlan = { objective: string; subquestions: string[]; outcome?: "query" | "not_possible"; limitation?: string };
+type AnalysisPlan = { objective: string; subquestions: string[]; outcome?: "query" | "not_possible" | "clarification"; limitation?: string; strategy?: string; metrics?: string[] };
 type ChatActivity = Pick<AgentStatus, "stage" | "message">;
 type GeminiSettings = { baseURL?: string; model?: string };
 type ChatProvider = { kind: "featherless" } | { kind: "gemini"; settings: GeminiSettings };
@@ -80,6 +80,8 @@ function AnalysisPlanView({ plan }: { plan: AnalysisPlan }) {
   return <aside style={{ marginTop: 10, padding: 14, border: "1px solid #ddd6fe", borderRadius: 10, background: "#f5f3ff" }}>
     <strong>Analysis plan</strong>
     <p style={{ margin: "6px 0", color: "#334155" }}>{plan.objective}</p>
+    {plan.strategy && <p style={{ margin: "6px 0", color: "#475569" }}>{plan.strategy}</p>}
+    {plan.metrics?.length ? <small style={{ color: "#475569" }}>Metrics: {plan.metrics.join(", ")}</small> : null}
     {plan.subquestions.length ? <ol style={{ margin: "8px 0 0", paddingLeft: 22 }}>{plan.subquestions.map((question, index) => <li key={index} style={{ marginTop: 4 }}>{question}</li>)}</ol> : <small style={{ color: "#64748b" }}>{plan.limitation ?? "The imported schema cannot answer this request."}</small>}
   </aside>;
 }
@@ -192,18 +194,21 @@ function DatasetChatSession({ datasetId, provider }: { datasetId: string; provid
 }
 
 export function DatasetAgentChat({ datasetId, datasetName }: { datasetId: string; datasetName: string }) {
-  const [selectedKind, setSelectedKind] = useState<ChatProvider["kind"]>("gemini");
+  const [selectedKind, setSelectedKind] = useState<ChatProvider["kind"]>("featherless");
   const [geminiSettings, setGeminiSettings] = useState<GeminiSettings>(defaultGeminiSettings);
-  const [activeProvider, setActiveProvider] = useState<ChatProvider>({ kind: "gemini", settings: defaultGeminiSettings });
+  const [activeProvider, setActiveProvider] = useState<ChatProvider>({ kind: "featherless" });
   const [sessionKey, setSessionKey] = useState(0);
   const [settingsMessage, setSettingsMessage] = useState("");
 
   useEffect(() => {
     try {
       const saved = JSON.parse(window.localStorage.getItem(providerStorageKey) ?? "") as { kind?: ChatProvider["kind"]; settings?: GeminiSettings };
-      const settings = saved.settings ?? defaultGeminiSettings;
-      setGeminiSettings(settings);
-      if (saved.kind === "gemini") setActiveProvider({ kind: "gemini", settings });
+      if (saved.kind === "gemini") {
+        setSelectedKind("gemini");
+        const settings = saved.settings ?? defaultGeminiSettings;
+        setGeminiSettings(settings);
+        setActiveProvider({ kind: "gemini", settings });
+      }
     } catch {
       // A malformed local preference should never prevent the chat from loading.
     }
