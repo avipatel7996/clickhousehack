@@ -22,7 +22,7 @@ type EntityEvidence = {
   searched: Array<{ source: string; fields: string[] }>;
   conclusion: string;
 };
-type AnalysisPlan = { objective: string; subquestions: string[] };
+type AnalysisPlan = { objective: string; subquestions: string[]; outcome?: "query" | "not_possible"; limitation?: string };
 type ChatActivity = Pick<AgentStatus, "stage" | "message">;
 type GeminiSettings = { baseURL?: string; model?: string };
 type ChatProvider = { kind: "featherless" } | { kind: "gemini"; settings: GeminiSettings };
@@ -70,10 +70,9 @@ function analysisPlanFromPart(part: any): AnalysisPlan | null {
   if (part?.type !== "data-analysis-plan") return null;
   const value = part.data;
   if (!value || typeof value.objective !== "string" || !Array.isArray(value.subquestions)) return null;
-  // A single generic sentence adds no information and made simple requests
-  // look like an unfinished workflow. Keep the panel for genuine dependency
-  // plans only.
-  if (value.subquestions.length === 1 && /^run one bounded clickhouse query that answers the request/i.test(String(value.subquestions[0] ?? ""))) return null;
+  // A one-step query is visible in “Show work”; only show this panel for a
+  // real multi-step dependency plan or an explicit data limitation.
+  if (value.outcome === "query" && value.subquestions.length <= 1) return null;
   return value as AnalysisPlan;
 }
 
@@ -81,7 +80,7 @@ function AnalysisPlanView({ plan }: { plan: AnalysisPlan }) {
   return <aside style={{ marginTop: 10, padding: 14, border: "1px solid #ddd6fe", borderRadius: 10, background: "#f5f3ff" }}>
     <strong>Analysis plan</strong>
     <p style={{ margin: "6px 0", color: "#334155" }}>{plan.objective}</p>
-    <ol style={{ margin: "8px 0 0", paddingLeft: 22 }}>{plan.subquestions.map((question, index) => <li key={index} style={{ marginTop: 4 }}>{question}</li>)}</ol>
+    {plan.subquestions.length ? <ol style={{ margin: "8px 0 0", paddingLeft: 22 }}>{plan.subquestions.map((question, index) => <li key={index} style={{ marginTop: 4 }}>{question}</li>)}</ol> : <small style={{ color: "#64748b" }}>{plan.limitation ?? "The imported schema cannot answer this request."}</small>}
   </aside>;
 }
 
@@ -110,14 +109,15 @@ function InsightView({ insight }: { insight: Insight }) {
 }
 
 function WorkTrace({ parts }: { parts: any[] }) {
-  const steps = parts.filter((part) => part.type === "tool-inspect_dataset" || part.type === "tool-search_records" || part.type === "tool-query_clickhouse" || part.type === "tool-rank_entities");
+  const steps = parts.filter((part) => part.type === "data-sql-step" || part.type === "tool-inspect_dataset" || part.type === "tool-search_records" || part.type === "tool-query_clickhouse" || part.type === "tool-rank_entities");
   if (!steps.length) return null;
   const includesEntitySearch = steps.some((step) => step.type === "tool-search_records");
   return <details open={includesEntitySearch} style={{ marginTop: 10, border: "1px solid #e2e8f0", borderRadius: 8, padding: "8px 12px", background: "white" }}>
     <summary style={{ cursor: "pointer", fontWeight: 600 }}>Show work · {steps.length} ClickHouse step{steps.length === 1 ? "" : "s"}</summary>
     {steps.map((step, index) => {
-      const output = step.output ?? step.result;
-      return <div key={index} style={{ marginTop: 12, paddingTop: 12, borderTop: index ? "1px solid #e2e8f0" : undefined }}><strong>{index + 1}. {step.type.replace("tool-", "").replaceAll("_", " ")}</strong>{step.input && <pre style={{ whiteSpace: "pre-wrap", fontSize: 12, color: "#475569" }}>{JSON.stringify(step.input, null, 2)}</pre>}{output?.note && <p style={{ margin: "8px 0", color: "#334155" }}>{output.note}</p>}{output?.searched?.length ? <small>Searched: {output.searched.map((item: { source: string }) => item.source).join(", ")}</small> : null}{output?.sql && <pre style={{ whiteSpace: "pre-wrap", overflowX: "auto", fontSize: 12, background: "#0f172a", color: "#e2e8f0", padding: 10, borderRadius: 6 }}>{output.sql}</pre>}{typeof output?.rowCount === "number" && <small style={{ display: "block", marginTop: 6 }}>Returned {output.rowCount} row{output.rowCount === 1 ? "" : "s"}</small>}{output?.rows?.length ? <pre style={{ whiteSpace: "pre-wrap", overflowX: "auto", fontSize: 11 }}>{JSON.stringify(output.rows.slice(0, 5), null, 2)}</pre> : null}</div>;
+      const output = step.data ?? step.output ?? step.result;
+      const label = step.type === "data-sql-step" ? output?.question ?? "ClickHouse query" : step.type.replace("tool-", "").replaceAll("_", " ");
+      return <div key={index} style={{ marginTop: 12, paddingTop: 12, borderTop: index ? "1px solid #e2e8f0" : undefined }}><strong>{index + 1}. {label}</strong>{step.input && <pre style={{ whiteSpace: "pre-wrap", fontSize: 12, color: "#475569" }}>{JSON.stringify(step.input, null, 2)}</pre>}{output?.note && <p style={{ margin: "8px 0", color: "#334155" }}>{output.note}</p>}{output?.searched?.length ? <small>Searched: {output.searched.map((item: { source: string }) => item.source).join(", ")}</small> : null}{output?.sql && <pre style={{ whiteSpace: "pre-wrap", overflowX: "auto", fontSize: 12, background: "#0f172a", color: "#e2e8f0", padding: 10, borderRadius: 6 }}>{output.sql}</pre>}{typeof output?.rowCount === "number" && <small style={{ display: "block", marginTop: 6 }}>Returned {output.rowCount} row{output.rowCount === 1 ? "" : "s"}</small>}{output?.rows?.length ? <pre style={{ whiteSpace: "pre-wrap", overflowX: "auto", fontSize: 11 }}>{JSON.stringify(output.rows.slice(0, 5), null, 2)}</pre> : null}</div>;
     })}
   </details>;
 }

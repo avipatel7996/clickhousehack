@@ -146,12 +146,12 @@ type AnalystInsight = {
 };
 
 const analysisPlanSchema = z.object({
+  outcome: z.enum(["query", "not_possible"]),
   objective: z.string().trim().min(3).max(240),
-  subquestions: z.array(z.string().trim().min(3).max(220)).min(1).max(3),
-  entityTerms: z.array(z.string().trim().min(2).max(100)).max(6),
-  requirements: z.array(z.object({
-    purpose: z.string().trim().min(3).max(160),
-    matchingColumns: z.array(z.string().trim().min(1).max(120)).max(8),
+  limitation: z.string().trim().max(500).optional(),
+  queries: z.array(z.object({
+    question: z.string().trim().min(3).max(220),
+    sql: z.string().trim().min(8).max(5000),
   })).max(3),
 });
 
@@ -187,12 +187,11 @@ function isLiteralEntitySearchTerm(value: string) {
 }
 
 async function createAnalysisPlan(model: LanguageModel, question: string, context: DatasetContext): Promise<AnalysisPlan> {
-  const availableColumns = new Set(context.tables.flatMap((source) => source.columns.map((column) => column.name)));
   const fallback: AnalysisPlan = {
+    outcome: "not_possible",
     objective: question,
-    subquestions: ["Run one bounded ClickHouse query that answers the request from the available fields."],
-    entityTerms: [],
-    requirements: [],
+    limitation: "The SQL planner could not produce a safe executable query for this dataset.",
+    queries: [],
   };
   try {
     const schemaSummary = context.tables.slice(0, 12).map((source) => ({
@@ -204,19 +203,16 @@ async function createAnalysisPlan(model: LanguageModel, question: string, contex
       model,
       schema: analysisPlanSchema,
       schemaName: "analysis_plan",
-      schemaDescription: "A minimal, executable plan for a database question.",
+      schemaDescription: "An executable ClickHouse query plan for a database question.",
       temperature: 0,
-      prompt: `Create the minimum executable evidence plan for this user question: ${JSON.stringify(question)}\n\nAvailable imported tables and columns: ${JSON.stringify(schemaSummary)}\n\nRules:\n- Use one sub-question for a simple aggregate or lookup; add steps only for distinct entities, filters, or dependent evidence. Never add generic filler.\n- entityTerms is ONLY for literal values that must be found in data, such as a person's name, a named team, a title, or a product. It must be empty for output categories or aggregate instructions such as “top 10 players”, “best products”, “match data”, or “average score”. Put every distinct literal entity in a separate entry: for “Nolan and DeCaprio”, emit “Nolan” and “DeCaprio”, never one combined search. These are independent sub-questions whose evidence will be intersected by the final query.\n- For every required relationship/filter that needs a specific field, add a requirement with the exact matchingColumns from the schema. If the schema has no field that can verify it, use an empty matchingColumns array.\n- Never use world knowledge or invent a schema column.`,
+      prompt: `Write the minimum executable ClickHouse plan for this user question: ${JSON.stringify(question)}\n\nAvailable imported tables and columns: ${JSON.stringify(schemaSummary)}\n\nReturn outcome="query" with exact read-only ClickHouse SQL in queries, or outcome="not_possible" with a short limitation if the schema cannot answer the question.\n\nRules:\n- A simple lookup, preview, aggregate, or filter gets exactly one query. For example, “give first 10 rows” must be SELECT * FROM the exact imported table LIMIT 10.\n- Add a second or third query only when earlier data is genuinely needed to resolve an entity or verify a relationship; the final answer query must be last. Do not add generic planning prose.\n- Every query must be a single SELECT or WITH statement, use only exact table/column names from the supplied schema, and be bounded with LIMIT 50 or less unless it is an aggregate.\n- Do not use outside knowledge. Do not mutate data.`,
     });
     const plan = result.object;
     return {
+      outcome: plan.outcome,
       objective: plan.objective,
-      subquestions: [...new Set(plan.subquestions)].slice(0, 3),
-      entityTerms: atomicEntityTerms(plan.entityTerms.filter(isLiteralEntitySearchTerm)),
-      requirements: plan.requirements.map((requirement) => ({
-        purpose: requirement.purpose,
-        matchingColumns: requirement.matchingColumns.filter((column) => availableColumns.has(column)),
-      })).slice(0, 3),
+      limitation: plan.limitation,
+      queries: plan.queries.slice(0, 3),
     };
   } catch {
     return fallback;
@@ -328,55 +324,6 @@ function humanizeColumn(name: string) {
   return name.replace(/[_-]+/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
-/**
- * A raw row preview is a database operation, not an analytical problem. Do
- * not spend a model turn planning it: use one verified ClickHouse query and
- * return its rows to the structured renderer.
- */
-function previewLimit(question: string) {
-  const text = question.toLowerCase();
-  const asksForRows = /\b(rows?|records?|entries|table)\b/.test(text);
-  const asksForPreview = /\b(first|sample|preview)\b/.test(text);
-  const hasConstraints = /\b(where|with|whose|after|before|between|group|rank|order|sort|filter)\b/.test(text);
-  if (!asksForRows || !asksForPreview || hasConstraints) return null;
-  const count = text.match(/\b(?:first|sample|preview)\s+(\d{1,2})\b/)?.[1];
-  return Math.min(50, Math.max(1, Number(count ?? 10)));
-}
-
-function displayCell(value: unknown): string | number | boolean | null {
-  if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") return value;
-  if (value === undefined) return null;
-  return JSON.stringify(value);
-}
-
-async function prepareTablePreview(context: DatasetContext, question: string): Promise<AnalystInsight | null> {
-  const limit = previewLimit(question);
-  if (!limit) return null;
-  const source = context.tables[0];
-  if (!source) return null;
-  const workflow = createWorkflowReporter();
-  workflow.status("querying", `Fetching the first ${limit} rows`);
-  workflow.event("planning", "Classified this as a direct table preview", "completed");
-  const sql = `SELECT * FROM ${source.table} LIMIT ${limit}`;
-  const clickhouse = new ClickHouseClient(createClickHouseConfig());
-  const result = await workflow.activity("querying", `Running ${source.sourcePath ?? source.table} preview query`, async () => {
-    const verified = validateReadOnlySql(sql, [source.table]);
-    if (!verified.ok) throw new Error(verified.error);
-    return clickhouse.query<Record<string, unknown>>(sql, { timeoutMs: 15_000 });
-  }, (value) => `ClickHouse returned ${value.rows.length} row${value.rows.length === 1 ? "" : "s"}`);
-  const columns = result.rows.length ? Object.keys(result.rows[0]) : source.columns.map((column) => column.name);
-  const rows = result.rows.map((row) => Object.fromEntries(columns.map((column) => [column, displayCell(row[column])]))) as Array<Record<string, string | number | boolean | null>>;
-  workflow.event("answering", "Rendered the raw table rows", "completed");
-  workflow.status("answering", "Streaming the table preview");
-  return {
-    title: `First ${rows.length} rows`,
-    summary: rows.length ? `Raw rows from ${source.sourcePath ?? source.table}.` : `No rows were returned from ${source.sourcePath ?? source.table}.`,
-    cards: [],
-    table: { columns, rows },
-    caveat: "This is an unfiltered table preview; ClickHouse does not guarantee a semantic order unless you request one.",
-  };
-}
-
 async function prepareUnfilteredRanking(context: DatasetContext, question: string): Promise<AnalystInsight | null> {
   if (!isUnfilteredRankingRequest(question)) return null;
   const terms = questionTerms(question);
@@ -412,7 +359,7 @@ async function prepareUnfilteredRanking(context: DatasetContext, question: strin
         { purpose: "Group the records by entity", matchingColumns: [target.entity] },
         { purpose: "Aggregate the ranking metric", matchingColumns: [target.metric] },
       ],
-    } satisfies AnalysisPlan,
+    },
   } as never);
   workflow.status("planning", "Planning one schema-driven aggregate");
   workflow.event("planning", "1/3 Classified this as an unfiltered ranking", "completed");
@@ -505,43 +452,63 @@ async function searchImportedTextFields(context: DatasetContext, clickhouse: Cli
   };
 }
 
-async function executeAnalysisPlan(context: DatasetContext, plan: AnalysisPlan) {
-  const terms = atomicEntityTerms(plan.entityTerms);
-  if (!terms.length) return [] as SearchResult[];
-  const clickhouse = new ClickHouseClient(createClickHouseConfig());
-  const workflow = createWorkflowReporter();
-  const results = await Promise.all(terms.map((term) => workflow.activity(
-    "searching",
-    `Executing plan: resolving “${term}” across imported data`,
-    () => searchImportedTextFields(context, clickhouse, term, 10),
-    (result) => result.rowCount
-      ? `Resolved “${term}”: ${result.rowCount} matching record${result.rowCount === 1 ? "" : "s"}`
-      : `No matching values for “${term}” across ${result.searched.length} imported files`,
-  )));
-  for (const result of results) {
-    chat.response.write({
-      type: "data-entity-evidence",
-      id: `entity-evidence-${crypto.randomUUID()}`,
-      data: entityEvidence(result),
-    } as never);
-  }
-  return results;
+type ExecutedPlanQuery = {
+  question: string;
+  sql: string;
+  rows: Array<Record<string, unknown>>;
+  rowCount: number;
+  tables: string[];
+};
+
+function displayQueryValue(value: unknown): string | number | boolean | null {
+  if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") return value;
+  if (value === undefined) return null;
+  return JSON.stringify(value) ?? null;
 }
 
-function blockerInsight(question: string, plan: AnalysisPlan, results: SearchResult[]): AnalystInsight | null {
-  const missing = results.filter((result) => !result.rowCount);
-  // Preflight misses are evidence for the final relationship query. Do not
-  // stop before the model applies all constraints and checks the intersection.
-  if (!missing.length || missing.length < results.length || !results.length) return null;
-  const rows = [
-    ...missing.map((result) => ({ Check: `Find “${result.query}”`, Outcome: "No matching values in imported text fields" })),
-  ];
+async function executeSqlPlan(context: DatasetContext, plan: AnalysisPlan) {
+  const workflow = createWorkflowReporter();
+  const clickhouse = new ClickHouseClient(createClickHouseConfig());
+  const allowedTables = context.tables.map((source) => source.table);
+  const completed: ExecutedPlanQuery[] = [];
+  for (const [index, step] of plan.queries.entries()) {
+    const result = await workflow.activity("querying", `${index + 1}/${plan.queries.length} ${step.question}`, async () => {
+      const verified = validateReadOnlySql(step.sql, allowedTables);
+      if (!verified.ok) throw new Error(verified.error);
+      const query = await clickhouse.query<Record<string, unknown>>(step.sql, { timeoutMs: 15_000 });
+      return { rows: query.rows, tables: verified.tables };
+    }, (value) => `ClickHouse returned ${value.rows.length} row${value.rows.length === 1 ? "" : "s"}`);
+    const evidence: ExecutedPlanQuery = { question: step.question, sql: step.sql, rows: result.rows, rowCount: result.rows.length, tables: result.tables };
+    completed.push(evidence);
+    chat.response.write({
+      type: "data-sql-step",
+      id: `sql-step-${crypto.randomUUID()}`,
+      data: evidence,
+    } as never);
+  }
+  return completed;
+}
+
+function planInsight(context: DatasetContext, plan: AnalysisPlan, completed: ExecutedPlanQuery[]): AnalystInsight {
+  const final = completed.at(-1);
+  if (!final) {
+    return {
+      title: "The dataset cannot answer this request",
+      summary: plan.limitation ?? "No safe executable ClickHouse query could be produced from the imported schema.",
+      cards: [],
+      table: { columns: ["Status"], rows: [{ Status: "Not possible from the imported data" }] },
+      caveat: "No result was inferred outside the dataset.",
+    };
+  }
+  const source = final.tables.map((table) => context.tables.find((candidate) => candidate.table === table)?.sourcePath ?? table).join(", ");
+  const columns = final.rows.length ? Object.keys(final.rows[0]) : [];
+  const rows = final.rows.slice(0, 20).map((row) => Object.fromEntries(columns.map((column) => [column, displayQueryValue(row[column])]))) as Array<Record<string, string | number | boolean | null>>;
   return {
-    title: "The dataset cannot verify this request yet",
-    summary: `The plan found a specific evidence gap for: ${question}`,
-    cards: rows.slice(0, 3).map((row) => ({ label: row.Check, value: "Not verifiable", detail: row.Outcome })),
-    table: { columns: ["Check", "Outcome"], rows },
-    caveat: "The analyst stopped rather than infer an answer from outside the imported data. Import data containing the missing field or use a narrower question.",
+    title: plan.objective,
+    summary: `Executed ${completed.length} validated ClickHouse ${completed.length === 1 ? "query" : "queries"}; the final query returned ${final.rowCount} row${final.rowCount === 1 ? "" : "s"}.`,
+    cards: [{ label: "Final rows", value: String(final.rowCount) }, { label: "SQL steps", value: String(completed.length) }],
+    table: { columns, rows },
+    caveat: `Source: ${source || "imported dataset"}. Results are limited to the rows returned by the final query.`,
   };
 }
 
@@ -671,76 +638,54 @@ export const datasetChat = chat
         transient: true,
       } as never);
     },
-    run: async ({ messages, tools, clientData, signal }) => {
+    run: async ({ messages, clientData }) => {
       if (!clientData) throw new Error("Dataset context is required");
       const context = datasetContext.get();
       const question = latestUserQuestion(messages);
-      const preview = question ? await prepareTablePreview(context, question) : null;
-      if (preview) {
-        chat.response.write({
-          type: "data-analyst-insight",
-          id: `analyst-table-preview-${crypto.randomUUID()}`,
-          data: preview,
-        } as never);
-        return;
-      }
+      if (!question) throw new Error("A question is required");
       const model = resolveChatModel(clientData);
-      const planner = question ? createWorkflowReporter() : undefined;
-      const plan = question && planner ? await planner.activity(
+      const planner = createWorkflowReporter();
+      const plan = await planner.activity(
         "planning",
-        "Creating the minimum evidence plan",
+        "Writing an executable ClickHouse plan",
         () => createAnalysisPlan(model, question, context),
-        (value) => `Created ${value.subquestions.length} focused sub-question${value.subquestions.length === 1 ? "" : "s"}`,
-      ) : undefined;
-      if (plan) {
-        chat.response.write({
-          type: "data-analysis-plan",
-          id: `analysis-plan-${crypto.randomUUID()}`,
-          data: plan,
-        } as never);
-      }
-      const plannedEvidence = plan ? await executeAnalysisPlan(context, plan) : [];
-      const blocker = question && plan ? blockerInsight(question, plan, plannedEvidence) : null;
-      if (blocker) {
+        (value) => value.outcome === "query"
+          ? `Created ${value.queries.length} executable SQL step${value.queries.length === 1 ? "" : "s"}`
+          : "Determined that the imported schema cannot answer this request",
+      );
+      chat.response.write({
+        type: "data-analysis-plan",
+        id: `analysis-plan-${crypto.randomUUID()}`,
+        data: { objective: plan.objective, subquestions: plan.queries.map((step) => step.question), outcome: plan.outcome, limitation: plan.limitation },
+      } as never);
+      if (plan.outcome !== "query" || !plan.queries.length) {
         chat.response.write({
           type: "data-analyst-insight",
-          id: "analyst-blocker",
-          data: blocker,
+          id: `analyst-limitation-${crypto.randomUUID()}`,
+          data: planInsight(context, plan, []),
         } as never);
         return;
       }
-      const streamOptions = chat.toStreamTextOptions({ tools });
-      const preflight = plan ? JSON.stringify({
-        plan: { objective: plan.objective, subquestions: plan.subquestions, requirements: plan.requirements },
-        entityEvidence: plannedEvidence.map((result) => ({ query: result.query, rowCount: result.rowCount, note: result.note, rows: result.rows.slice(0, 3) })),
-      }) : "No preflight plan was required.";
-      return streamText({
-        ...streamOptions,
-        // Gemini is selected per session; Featherless retains its fast
-        // non-reasoning default for sessions that do not opt into Gemini.
-        model,
-        system: `You are a precise, fast data analyst for arbitrary imported datasets. Answer only from ClickHouse results. Dataset tables and schemas: ${JSON.stringify(context.tables)}. The orchestrator created this minimum evidence plan: ${preflight}. Treat each listed sub-question as an actual dependency: use its evidence to choose fields and constraints, then run one final bounded query that answers the original question. Do not skip the final relationship/intersection check. Use completed preflight checks; do not repeat identical searches. Resolve only literal named values with search_records. Never search output categories or aggregate instructions such as “top 10 players”; directly aggregate using schema columns instead. Run a bounded read-only query that applies every supported constraint; compare the result with the original question before answering, and explicitly state unsupported constraints or zero evidence. search_records searches every imported text field using substring matching. If it finds nothing, say what was searched and never infer an identity from outside knowledge. If it finds multiple candidates, state the candidates and the data-backed reason for any selection before continuing. Never repeat an identical tool call. Use rank_entities only for multi-metric rankings and select its table explicitly when necessary. Do not inspect the dataset unless a sample is necessary. End every workflow with present_insight: it is the final answer contract and must include either verified results or a precise data limitation. Keep any supporting text under 120 words. Do not describe hidden reasoning. Never invent facts.`,
-        messages,
-        abortSignal: signal,
-        maxOutputTokens: 240,
-        temperature: 0,
-        stopWhen: stepCountIs(4),
-        onFinish: async (event) => {
-          const producedInsight = event.steps.some((step) => step.toolCalls.some((call) => call.toolName === "present_insight"));
-          if (!event.text.trim() && !producedInsight) {
-            chat.response.write({
-              type: "data-analyst-insight",
-              id: "analyst-incomplete-workflow",
-              data: {
-                title: "The analyst did not complete a verifiable answer",
-                summary: "The workflow ended before it produced a final evidence-backed result.",
-                cards: [],
-                table: { columns: ["Status", "Next step"], rows: [{ Status: "Incomplete workflow", "Next step": "Retry the question; the visible plan and evidence are preserved for diagnosis." }] },
-                caveat: "No answer was inferred from incomplete work.",
-              } satisfies AnalystInsight,
-            } as never);
-          }
-        },
-      });
+      try {
+        const completed = await executeSqlPlan(context, plan);
+        chat.response.write({
+          type: "data-analyst-insight",
+          id: `analyst-insight-${crypto.randomUUID()}`,
+          data: planInsight(context, plan, completed),
+        } as never);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        chat.response.write({
+          type: "data-analyst-insight",
+          id: `analyst-query-error-${crypto.randomUUID()}`,
+          data: {
+            title: "The SQL plan could not be executed",
+            summary: "The agent produced a query that ClickHouse rejected, so no answer was inferred.",
+            cards: [],
+            table: { columns: ["Status", "Detail"], rows: [{ Status: "Query failed", Detail: message }] },
+            caveat: "The visible SQL step is retained for diagnosis and correction.",
+          } satisfies AnalystInsight,
+        } as never);
+      }
     },
   });
